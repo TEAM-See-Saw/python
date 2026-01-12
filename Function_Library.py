@@ -52,7 +52,7 @@ RED, GREEN, BLUE, YELLOW = (0, 1, 2, 3)
 FORWARD, LEFT, RIGHT = (0, 1, 2)
 COLOR = ("RED", "GREEN", "BLUE", "YELLOW")
 DIRECTION = ("FORWARD", "LEFT", "RIGHT")
-HUE_THRESHOLD = ([4, 176], [40, 80], [110, 130], [20, 40])
+HUE_THRESHOLD = ([4, 176], [40, 80], [110, 130], [20, 40]) # 대회 현장에서 조명 상황에 따라 바꿀 수 있음
 """-----------------------------------------------------"""
 
 
