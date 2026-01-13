@@ -4,10 +4,12 @@ import keyboard
 import json
 import os
 
+# 아두이노 코드를 steering.ino로 변경 후 실행할 것!
+
 # ==========================================
 # [1] 설정
 # ==========================================
-PORT = 'COM3'  # 포트 번호 확인 필수
+PORT = 'COM4'  # 포트 번호 확인 필수
 BAUDRATE = 9600
 LOG_FILE = 'driving_log.json'  # 기록 저장 파일명
 
