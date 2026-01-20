@@ -3,21 +3,23 @@ import numpy as np
 import math
 import serial
 import time
+import datetime  # [추가] 파일명에 시간을 넣기 위해 필요
 
 # ==========================================
-# [1] 설정 (본인 환경에 맞게 수정)
+# [1] 설정 (카메라 및 아두이노)
 # ==========================================
+# ★ 카메라 번호 선택
+CAM_INDEX = 0
+# CAM_INDEX = 1
+
 PORT = 'COM4'  # 아두이노 연결 포트
 BAUDRATE = 9600  # 통신 속도
-
-# 영상 경로 (사용자 kimmi 환경에 맞춤)
-VIDEO_PATH = r'C:\Users\kimmi\Downloads\curv.mp4'
 
 # ⚙️ 아두이노 제어 설정
 SERVO_CENTER = 570
 SERVO_LEFT_MAX = 680  # 좌회전 한계값
 SERVO_RIGHT_MAX = 480  # 우회전 한계값
-MAX_SPEED = 255  # 주행 최고 속도 (0~255)
+MAX_SPEED = 255  # 주행 최고 속도
 
 # ==========================================
 # [2] 시리얼 연결
@@ -28,10 +30,12 @@ try:
     time.sleep(2)  # 아두이노 리셋 대기
 except Exception as e:
     print(f"❌ 아두이노 연결 실패: {e}")
-    # 아두이노 없이 영상만 테스트하려면 아래 exit()를 주석 처리하세요.
     exit()
 
 
+# ==========================================
+# [3] 함수 정의 (기존 로직 유지)
+# ==========================================
 def region_of_interest(img, vertices):
     mask = np.zeros_like(img)
     match_mask_color = 255
@@ -75,7 +79,6 @@ def average_slope_intercept(image, lines):
 
 
 def map_value(x, in_min, in_max, out_min, out_max):
-    # 범위 변환 함수 (Arduino map과 동일)
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
 
 
@@ -103,36 +106,62 @@ def calculate_steering_angle(image, left_line, right_line):
     return angle_deg, int(target_x)
 
 
+# ==========================================
+# [4] 메인 루프 (카메라 처리)
+# ==========================================
 def main():
-    cap = cv2.VideoCapture(VIDEO_PATH)
+    print(f"📷 카메라 #{CAM_INDEX} 연결 시도 중...")
+    cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
 
-    # 영상 파일 열기 확인
+    # 해상도 강제 설정 (640x480)
+    target_width = 640
+    target_height = 480
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_height)
+
     if not cap.isOpened():
-        print(f"❌ 오류: 영상 파일을 열 수 없습니다.\n👉 경로 확인: {VIDEO_PATH}")
+        print(f"❌ 오류: 카메라 #{CAM_INDEX}를 열 수 없습니다.")
         return
 
-    print(f"🚀 시뮬레이션 시작! 최고 속도(PWM {MAX_SPEED})로 뒷바퀴가 회전합니다.")
+    # ========================================================
+    # [녹화 설정] VideoWriter 초기화
+    # ========================================================
+    # 현재 시간을 파일명에 포함 (예: recording_20260120_143000.avi)
+    now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"drive_log_{now}.avi"
+
+    # 코덱 설정 (Windows는 'XVID' 또는 'MJPG' 권장)
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    fps = 20.0  # 녹화 프레임 속도
+
+    # VideoWriter 객체 생성 (파일명, 코덱, FPS, 해상도)
+    out = cv2.VideoWriter(filename, fourcc, fps, (target_width, target_height))
+
+    print(f"🎥 녹화 시작: {filename} 파일로 저장됩니다.")
+    # ========================================================
+
+    print("🚀 실시간 라인 트레이싱 시작!")
     print("⚠️ 주의: 차체가 공중에 떠 있는지 확인하세요!")
 
-    # [핵심] 시작하자마자 최고 속도 명령 전송
+    # 모터 구동 명령 (현재 주석 해제됨)
     ser.write(f"D,{MAX_SPEED}\n".encode())
 
-    while cap.isOpened():
+    while True:
         ret, frame = cap.read()
-        if not ret:
-            # 영상이 끝나면 처음으로 되감기 (무한 루프)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            continue
 
-        # 1. 전처리 (Resize & Edge Detection)
-        frame = cv2.resize(frame, (640, 480))
+        if not ret:
+            print("⚠️ 카메라 신호 없음. 종료합니다.")
+            break
+
+        # 1. 전처리
+        frame = cv2.resize(frame, (target_width, target_height))
         height, width, _ = frame.shape
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
         edges = cv2.Canny(blur, 50, 150)
 
-        # 2. ROI 설정 (관심 영역)
+        # 2. ROI 설정
         roi_vertices = [
             (0, height),
             (width // 2 - 50, int(height * 0.6)),
@@ -141,26 +170,23 @@ def main():
         ]
         cropped_edges = region_of_interest(edges, np.array([roi_vertices], np.int32))
 
-        # 3. 차선 검출 (Hough Transform)
+        # 3. 차선 검출
         lines = cv2.HoughLinesP(cropped_edges, 1, np.pi / 180, 50, minLineLength=40, maxLineGap=100)
         left_line, right_line = average_slope_intercept(frame, lines)
 
         # 4. 조향각 계산
         steering_angle, target_x = calculate_steering_angle(frame, left_line, right_line)
 
-        # 5. [Mapping] 각도 -> 아두이노 서보 값 변환
-        # 영상 각도: -45(Left) ~ 45(Right) 가정
-        # 서보 값: 680(Left) ~ 480(Right)
-
-        clamped_angle = max(-45, min(45, steering_angle))  # 각도 제한
+        # 5. 아두이노 매핑
+        clamped_angle = max(-45, min(45, steering_angle))
         servo_value = map_value(clamped_angle, -45, 45, SERVO_LEFT_MAX, SERVO_RIGHT_MAX)
         servo_value = int(servo_value)
 
-        # 6. 아두이노로 조향 명령 전송 (S,값\n)
+        # 6. 명령 전송
         cmd = f"S,{servo_value}\n"
         ser.write(cmd.encode())
 
-        # --- 시각화 (화면에 그리기) ---
+        # --- 시각화 ---
         line_image = np.zeros_like(frame)
         if left_line is not None:
             for x1, y1, x2, y2 in left_line:
@@ -170,28 +196,32 @@ def main():
                 cv2.line(line_image, (x1, y1), (x2, y2), (0, 255, 0), 5)
 
         combo_image = cv2.addWeighted(frame, 0.8, line_image, 1, 1)
-        # 주행 방향 가이드라인 (Red)
         cv2.line(combo_image, (int(width / 2), height), (int(target_x), int(height * 0.6)), (0, 0, 255), 3)
 
-        # 정보 텍스트 표시
         cv2.putText(combo_image, f"Angle: {steering_angle:.2f}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255),
                     2)
         cv2.putText(combo_image, f"Servo: {servo_value}", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-        cv2.putText(combo_image, f"Motor: {MAX_SPEED} (MAX)", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
-        cv2.imshow('Lane Assist Simulation (Running)', combo_image)
+        # ========================================================
+        # [녹화 저장] 현재 처리된 프레임(combo_image)을 파일에 쓰기
+        # ========================================================
+        out.write(combo_image)
+        # ========================================================
 
-        # 'q' 키를 누르면 종료
+        cv2.imshow('Live Lane Tracing', combo_image)
+
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    # ------------------------------------------
-    # [종료 절차] 안전하게 정지
-    # ------------------------------------------
-    print("🛑 시뮬레이션 종료: 모터 및 조향 초기화")
+    # 종료 처리
+    print("🛑 프로그램 종료: 정지 및 초기화")
     ser.write(b"D,0\n")  # 모터 정지
     time.sleep(0.1)
-    ser.write(b"S,570\n")  # 조향 중앙 정렬
+    ser.write(b"S,570\n")  # 조향 중앙
+
+    # [녹화 종료] 파일 닫기
+    out.release()
+    print(f"💾 녹화 저장 완료: {filename}")
 
     ser.close()
     cap.release()
