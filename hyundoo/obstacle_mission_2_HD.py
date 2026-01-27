@@ -18,7 +18,7 @@ BAUDRATE = 9600
 # 1. 차가 회피할 때 너무 확 꺾이거나 벽을 박으면? -> OFFSET_VAL을 줄이기 (예: 100)
 # 2. 회피는 했는데 덜 넘어갔는데 직진하려고 하면? -> LANE_CHANGE_TIME을 늘리기 (예: 2.5)
 OFFSET_VAL = 150        
-LANE_CHANGE_TIME = 2.0  
+LANE_CHANGE_TIME = 2.0
 
 NORMAL_SPEED = 150      # 평상시 속도
 AVOID_SPEED = 130       # 회피 시 감속 (안전을 위해 낮춤)
