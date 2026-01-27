@@ -19,10 +19,10 @@ SERVO_CENTER = 570
 SERVO_LEFT_MAX = 680
 SERVO_RIGHT_MAX = 480
 
-AVOID_DISTANCE = 500  # 장애물 감지 거리 (mm)
-DETECT_ANGLE = 30     # 전방 감시 각도
+AVOID_DISTANCE = 15  # 장애물 감지 거리 (mm)
+DETECT_ANGLE = 60     # 전방 감시 각도
 
-IS_SUNNY = True       # 조명 모드
+IS_SUNNY = False       # 조명 모드
 
 # ==========================================
 # [2] 전역 변수
