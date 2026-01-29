@@ -3,8 +3,6 @@ import numpy as np
 import math
 import serial
 import time
-import datetime
-import os
 
 # ==========================================
 # [1] 환경 및 튜닝 설정
@@ -30,10 +28,9 @@ SERVO_RIGHT_MAX = 480
 # 1. 높이 비율 (카메라 각도에 따라 0.6 ~ 0.8 조절)
 ROI_HEIGHT_RATIO = 0.6
 
-# 2. 좌우 폭 비율 (기존 200/640, 440/640 비율 고정)
-# 이 비율을 쓰면 사다리꼴 모양이 찌그러지지 않고 유지됩니다.
-ROI_X_LEFT_RATIO = 0.3125  # 상단 좌측
-ROI_X_RIGHT_RATIO = 0.6875  # 상단 우측
+# 2. 좌우 폭 비율 (해상도 변경에도 사다리꼴 모양 유지)
+ROI_X_LEFT_RATIO = 0.3125  # 상단 좌측 (기존 200/640)
+ROI_X_RIGHT_RATIO = 0.6875  # 상단 우측 (기존 440/640)
 
 # 영상 처리 임계값 설정
 if IS_SUNNY:
@@ -141,15 +138,6 @@ def main():
 
     if not cap.isOpened(): print("❌ 카메라 오류"); return
 
-    if not os.path.exists('dataset'): os.makedirs('dataset')
-    filename = f"dataset/drive_{datetime.datetime.now().strftime('%H%M%S')}.mp4"
-    try:
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')
-    except:
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(filename, fourcc, 20.0, (width * 2, height))
-    print(f"🎥 녹화 시작: {filename}")
-
     print("\n🚀 3초 후 출발!");
     for i in range(3, 0, -1): print(f"{i}.."); time.sleep(1)
 
@@ -170,7 +158,7 @@ def main():
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones(MORPH_SIZE, np.uint8))
         edges = cv2.Canny(mask, 50, 150)
 
-        # ★ [수정됨] 고정값 대신 비율(Ratio)을 사용하여 사다리꼴 좌표 생성
+        # ★ [핵심] 고정값 대신 비율(Ratio)을 사용하여 사다리꼴 좌표 생성
         roi_points = np.array([[
             (0, h),
             (w, h),
@@ -203,7 +191,6 @@ def main():
         combined = np.hstack((frame, mask_bgr))
         cv2.putText(combined, f"Servo: {servo_val}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-        out.write(combined)
         cv2.imshow("Auto Drive", combined)
 
         if cv2.waitKey(1) == ord('q'): break
@@ -213,7 +200,7 @@ def main():
         time.sleep(0.1)
         ser.write(b"S,570\n");
         ser.close()
-    out.release();
+
     cap.release();
     cv2.destroyAllWindows()
 
