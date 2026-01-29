@@ -12,26 +12,44 @@ from Function_Library import libCAMERA
 IS_SUNNY = False
 ARDUINO_PORT = 'COM4'
 LIDAR_PORT = 'COM3'
+SERIAL_DELAY = 0.05
 
-# --- 속도 설정 ---
+# --- 속도 & 모터 설정 ---
 SPEED_NORMAL = 200
 SPEED_SLOW = 100
 SPEED_STOP = 0
-
-# --- 서보 모터 PWM 설정 ---
 SERVO_CENTER = 570
 SERVO_LEFT_MAX = 680
 SERVO_RIGHT_MAX = 480
+OBSTACLE_START_DIST = 1000
+SHIFT_GAIN = 1.2
 
-# --- 회피 기동 튜닝 ---
-OBSTACLE_START_DIST = 1000 # 라이다 감지 거리 - 박으면 늘리기
-SHIFT_GAIN = 1.2 # 타겟 오프셋 밀림 정도 - 박으면 늘리기
+# ========================================================
+# ★ [핵심] ROI 자동 연동 설정 (여기만 고치세요!)
+# ========================================================
+# 1. 차선 ROI 비율 (Master)
+# 카메라를 들수록 이 값을 키우세요. (0.6 -> 0.7 -> 0.8)
+ROI_LANE_HEIGHT_RATIO = 0.6
 
-# --- 영상 처리 설정 ---
+# 2. 신호등 ROI 비율 (Slave - 자동 계산)
+# 차선 ROI보다 5%(0.05) 위쪽까지만 봅니다. (겹침 방지 버퍼)
+ROI_TRAFFIC_HEIGHT = ROI_LANE_HEIGHT_RATIO - 0.05
+
+# 3. 차선 사다리꼴 폭 (황금 비율 고정)
+ROI_LANE_X_LEFT = 0.3125
+ROI_LANE_X_RIGHT = 0.6875
+
+# 영상 처리 필터
 if IS_SUNNY:
-    L_MIN = 160; S_MAX = 50; EXPOSURE = -9; MORPH_SIZE = (5, 5)
+    L_MIN = 160;
+    S_MAX = 50;
+    EXPOSURE = -9;
+    MORPH_SIZE = (5, 5)
 else:
-    L_MIN = 80; S_MAX = 120; EXPOSURE = -4; MORPH_SIZE = (3, 3)
+    L_MIN = 80;
+    S_MAX = 120;
+    EXPOSURE = -4;
+    MORPH_SIZE = (3, 3)
 
 
 # ==========================================
@@ -49,7 +67,7 @@ def make_points(image, line_parameters):
     except TypeError:
         return None
     y1 = image.shape[0];
-    y2 = int(y1 * 0.6)
+    y2 = int(y1 * ROI_LANE_HEIGHT_RATIO)  # ★ 변수 사용
     if slope == 0: slope = 0.001
     x1 = int((y1 - intercept) / slope);
     x2 = int((y2 - intercept) / slope)
@@ -79,7 +97,8 @@ def calculate_avoid_angle(image, left_line, right_line, obstacle_dist, last_angl
     height, width, _ = image.shape
     car_x = width / 2
 
-    # 1. 기본 타겟 계산
+    target_y = int(height * ROI_LANE_HEIGHT_RATIO)  # ★ 변수 사용
+
     if left_line is not None and right_line is not None:
         base_target = (left_line[0][2] + right_line[0][2]) / 2
     elif left_line is not None:
@@ -89,7 +108,6 @@ def calculate_avoid_angle(image, left_line, right_line, obstacle_dist, last_angl
     else:
         return last_angle, int(car_x + (last_angle * 5)), 0
 
-    # 2. 장애물 회피 (Raw 거리 사용)
     final_target = base_target
     shift_amount = 0
 
@@ -97,9 +115,8 @@ def calculate_avoid_angle(image, left_line, right_line, obstacle_dist, last_angl
         shift_amount = (OBSTACLE_START_DIST - obstacle_dist) * SHIFT_GAIN
         final_target = base_target - shift_amount
 
-    # 3. 조향 각도 산출
     dx = final_target - car_x
-    dy = (height * 0.6) - height
+    dy = (height - target_y)
     angle = math.degrees(math.atan2(dx, abs(dy)))
 
     return angle, int(final_target), int(shift_amount)
@@ -114,9 +131,10 @@ def map_servo(angle):
 # [3] 초기화
 # ==========================================
 video_writer = None
+ser = None
 
 try:
-    ser = serial.Serial(ARDUINO_PORT, 9600, timeout=1)
+    ser = serial.Serial(ARDUINO_PORT, 9600, timeout=0.1)
     lidar = RPLidar(LIDAR_PORT)
     camera = libCAMERA()
     cam0, _ = camera.initial_setting(capnum=1)
@@ -127,10 +145,12 @@ try:
     if not cam0.isOpened(): raise Exception("카메라 에러")
 
     fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    video_writer = cv2.VideoWriter('mission_record_nofilter.avi', fourcc, 20.0, (640, 480))
+    video_writer = cv2.VideoWriter('mission_auto_roi.avi', fourcc, 20.0, (640, 480))
 
-    print("✅ 시스템 준비 완료: 라이다 필터 OFF (즉각 반응)")
+    print(f"✅ 설정 완료 | 차선ROI: {ROI_LANE_HEIGHT_RATIO * 100:.1f}% | 신호등ROI: {ROI_TRAFFIC_HEIGHT * 100:.1f}%")
     time.sleep(2)
+
+    if ser: ser.write(f"D,{SPEED_NORMAL}\n".encode())
 
 except Exception as e:
     print(f"❌ 초기화 오류: {e}");
@@ -140,88 +160,97 @@ except Exception as e:
 # [4] 메인 루프
 # ==========================================
 last_valid_angle = 0
+last_serial_time = 0
 
 try:
     for scan in lidar.iter_scans():
-
-        # 1. 라이다 (Raw Data 수집)
         raw_dist = 2000
         for (_, angle, dist) in scan:
             if 200 < dist < 1500:
                 if angle >= 330 or angle <= 30:
                     if dist < raw_dist: raw_dist = dist
 
-        # [필터 로직 제거됨] -> raw_dist를 그대로 사용합니다.
-
-        # 2. 영상
         ret, frame = cam0.read()
         if not ret: break
         frame = cv2.resize(frame, (640, 480))
+        h, w = frame.shape[:2]
 
-        traffic_light = camera.object_detection(frame, sample=5, print_enable=False)
+        # [A] 신호등 ROI (자동 계산된 비율 적용)
+        traffic_roi_h = int(h * ROI_TRAFFIC_HEIGHT)
+        traffic_frame = frame[0:traffic_roi_h, :]
+        traffic_light = camera.object_detection(traffic_frame, sample=3, print_enable=False)
 
+        # [B] 차선 ROI (설정된 비율 적용)
         hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
         mask = cv2.inRange(hls, np.array([0, L_MIN, 0]), np.array([179, 255, S_MAX]))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones(MORPH_SIZE, np.uint8))
         edges = cv2.Canny(mask, 50, 150)
 
-        # ROI (좁은 시야 유지)
-        roi = [(0, 480), (200, 280), (440, 280), (640, 480)]
-        cropped = region_of_interest(edges, np.array([roi], np.int32))
-        lines = cv2.HoughLinesP(cropped, 1, np.pi / 180, 50, minLineLength=40, maxLineGap=100)
+        lane_roi_points = np.array([[
+            (0, h),
+            (w, h),
+            (int(w * ROI_LANE_X_RIGHT), int(h * ROI_LANE_HEIGHT_RATIO)),
+            (int(w * ROI_LANE_X_LEFT), int(h * ROI_LANE_HEIGHT_RATIO))
+        ]], dtype=np.int32)
 
+        cropped = region_of_interest(edges, lane_roi_points)
+        lines = cv2.HoughLinesP(cropped, 1, np.pi / 180, 50, minLineLength=40, maxLineGap=100)
         l_line, r_line = average_slope_intercept(frame, lines)
 
-        # 3. 제어 (raw_dist 사용)
-        final_angle, target_px, shift_val = calculate_avoid_angle(frame, l_line, r_line, raw_dist,
-                                                                  last_valid_angle)
-
+        # 제어
+        final_angle, target_px, shift_val = calculate_avoid_angle(frame, l_line, r_line, raw_dist, last_valid_angle)
         last_valid_angle = final_angle
 
         final_speed = SPEED_NORMAL
         status_msg = "Run: Normal"
 
-        # 속도 제어도 Raw 거리 기준
         if raw_dist < 800:
             final_speed = SPEED_SLOW
             status_msg = "Run: AVOID"
 
         if traffic_light == "RED":
             final_speed = SPEED_STOP
-            status_msg = "RED STOP"
+            status_msg = "XXX RED STOP XXX"
 
-        # 4. 전송
-        pwm_cmd = map_servo(final_angle)
-        ser.write(f"S,{pwm_cmd}\n".encode())
-        ser.write(f"D,{final_speed}\n".encode())
+        # 전송 (딜레이 적용)
+        current_time = time.time()
+        if ser and (current_time - last_serial_time > SERIAL_DELAY):
+            pwm_cmd = map_servo(final_angle)
+            ser.write(f"S,{pwm_cmd}\n".encode())
+            ser.write(f"D,{final_speed}\n".encode())
+            last_serial_time = current_time
 
-        # 5. 디스플레이
-        cv2.circle(frame, (target_px, 300), 15, (0, 0, 255), -1)
-        cv2.polylines(frame, [np.array(roi, np.int32)], True, (255, 0, 0), 2)
+        # 디스플레이
+        # 1. 신호등 영역 표시 (빨간 박스)
+        cv2.rectangle(frame, (0, 0), (w, traffic_roi_h), (0, 0, 255), 2)
 
+        # 2. 차선 영역 표시 (파란 사다리꼴)
+        cv2.polylines(frame, [lane_roi_points], True, (255, 0, 0), 2)
+
+        # 3. 사이 공간 (버퍼존) 표시 - 회색 빗금 느낌 (선 하나 긋기)
+        # 신호등 끝선과 차선 시작선 사이의 빈 공간
+        cv2.line(frame, (0, traffic_roi_h), (w, traffic_roi_h), (100, 100, 100), 1)
+
+        # 목표점
+        cv2.circle(frame, (target_px, int(h * ROI_LANE_HEIGHT_RATIO)), 15, (0, 255, 255), -1)
         if l_line is not None:
             for x1, y1, x2, y2 in l_line: cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 5)
         if r_line is not None:
             for x1, y1, x2, y2 in r_line: cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 5)
 
-        # 필터 없는 거리값 표시
-        cv2.putText(frame, f"Lidar: {int(raw_dist)}mm", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-        cv2.putText(frame, status_msg, (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        cv2.putText(frame, f"Lidar: {int(raw_dist)}mm", (20, traffic_roi_h + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                    (0, 255, 255), 2)
+        cv2.putText(frame, status_msg, (20, traffic_roi_h + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-        if shift_val > 0:
-            cv2.putText(frame, f"SHIFT: {int(shift_val)}", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
-
-        cv2.imshow("Mission", frame)
+        cv2.imshow("Mission Auto ROI", frame)
         if video_writer is not None: video_writer.write(frame)
         if cv2.waitKey(1) == ord('q'): break
 
 except KeyboardInterrupt:
     print("종료")
 finally:
-    lidar.stop();
-    lidar.disconnect()
-    ser.write(b"D,0\n");
-    ser.close()
+    if lidar: lidar.stop(); lidar.disconnect()
+    if ser: ser.write(b"D,0\n"); ser.close()
     if video_writer is not None: video_writer.release()
     cam0.release();
     cv2.destroyAllWindows()

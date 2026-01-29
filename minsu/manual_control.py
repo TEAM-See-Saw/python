@@ -1,20 +1,18 @@
 import serial
 import time
-import keyboard  # pip install keyboard
-import cv2  # pip install opencv-python
-import datetime  # 파일명 날짜 생성용
-import numpy as np
+import keyboard
+import cv2
+import datetime
+import csv  # ★ 엑셀 저장을 위해 추가
+import os
 
 # ==========================================
 # [1] 설정
 # ==========================================
-# ★ 카메라 번호 확인 (0 또는 1)
 CAM_INDEX = 0
-
-PORT = 'COM4'  # 본인 포트 번호
+PORT = 'COM4'
 BAUDRATE = 9600
 
-# ⚙️ 제어 값 설정
 VAL_LEFT = 680
 VAL_RIGHT = 480
 VAL_CENTER = 570
@@ -22,135 +20,117 @@ SPEED_FWD = 255
 SPEED_STOP = 0
 
 # ==========================================
-# [2] 장치 연결 (아두이노 + 카메라)
+# [2] 초기화
 # ==========================================
-# 1. 아두이노 연결
+# 1. 아두이노
 try:
     ser = serial.Serial(PORT, BAUDRATE, timeout=1)
-    print(f"✅ {PORT} 포트에 연결되었습니다.")
     time.sleep(2)
 except Exception as e:
     print(f"❌ 아두이노 연결 실패: {e}")
-    # 카메라만 테스트하려면 아래 exit() 주석 처리
     exit()
 
-# 2. 카메라 연결
-print(f"📷 카메라 #{CAM_INDEX} 연결 시도 중...")
+# 2. 카메라
 cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
-target_w, target_h = 640, 480
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_w)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_h)
+cap.set(3, 640)
+cap.set(4, 480)
 
-if not cap.isOpened():
-    print("❌ 카메라를 열 수 없습니다.")
-    exit()
-
-# 3. 녹화 설정 (MP4, H.264)
+# 3. 파일 저장 설정 (영상 + 로그)
 now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-filename = f"manual_drive_{now}.mp4"
-try:
-    fourcc = cv2.VideoWriter_fourcc(*'avc1')  # 맥/윈도우 호환
-except:
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # 비상용
+video_filename = f"drive_data_{now}.mp4"
+csv_filename = f"drive_data_{now}.csv"  # ★ 로그 파일 이름
 
-fps = 20.0
-out = cv2.VideoWriter(filename, fourcc, fps, (target_w, target_h))
-print(f"🎥 녹화 시작: {filename}")
+# 영상 라이터
+fourcc = cv2.VideoWriter_fourcc(*'avc1')
+out = cv2.VideoWriter(video_filename, fourcc, 20.0, (640, 480))
+
+# ★ 로그 파일 생성 및 헤더 작성
+csv_file = open(csv_filename, 'w', newline='')
+csv_writer = csv.writer(csv_file)
+# 헤더: 경과시간, 조향각, 모터속도
+csv_writer.writerow(['elapsed_time', 'servo_val', 'motor_speed'])
+
+print(f"🎥 녹화 및 로깅 시작: {video_filename}, {csv_filename}")
+print("🚗 주행을 시작하세요! (ESC: 종료)")
 
 # ==========================================
 # [3] 메인 루프
 # ==========================================
-last_steer_val = -1
-last_motor_speed = -1
-current_action = "STOP"  # 화면 표시용 텍스트
+last_steer_val = VAL_CENTER
+last_motor_speed = SPEED_STOP
 
-print("\n🚗 [주행 및 녹화 시작]")
-print("  키보드 방향키로 조종하세요. (ESC: 종료)")
+# ★ 시작 시간 기준점
+start_time = time.time()
 
 try:
     while True:
-        # ----------------------------------
-        # 0. 카메라 프레임 읽기 & 녹화
-        # ----------------------------------
         ret, frame = cap.read()
-        if not ret:
-            print("⚠️ 카메라 신호 끊김")
-            break
+        if not ret: break
+        frame = cv2.resize(frame, (640, 480))
 
-        frame = cv2.resize(frame, (target_w, target_h))
-
-        # ----------------------------------
-        # 1. 조향 (Steering)
-        # ----------------------------------
+        # --- 1. 키보드 입력 처리 ---
+        # 조향
         if keyboard.is_pressed('left'):
-            target_val = VAL_LEFT
+            curr_steer = VAL_LEFT
             steer_text = "LEFT"
         elif keyboard.is_pressed('right'):
-            target_val = VAL_RIGHT
+            curr_steer = VAL_RIGHT
             steer_text = "RIGHT"
         else:
-            target_val = VAL_CENTER
+            curr_steer = VAL_CENTER
             steer_text = "CENTER"
 
-        if target_val != last_steer_val:
-            cmd = f"S,{target_val}\n"
-            ser.write(cmd.encode())
-            last_steer_val = target_val
-            # time.sleep은 영상 끊김 방지를 위해 최소화하거나 제거
-
-        # ----------------------------------
-        # 2. 구동 (Drive)
-        # ----------------------------------
+        # 구동
         if keyboard.is_pressed('up'):
-            target_speed = SPEED_FWD
+            curr_speed = SPEED_FWD
             motor_text = "FWD"
         elif keyboard.is_pressed('down'):
-            target_speed = SPEED_STOP
+            curr_speed = SPEED_STOP  # 후진 구현 시 변경 가능
             motor_text = "STOP"
         else:
-            target_speed = SPEED_STOP  # 키 떼면 정지
+            curr_speed = SPEED_STOP
             motor_text = "STOP"
 
-        if target_speed != last_motor_speed:
-            cmd = f"D,{target_speed}\n"
-            ser.write(cmd.encode())
-            last_motor_speed = target_speed
+        # --- 2. 아두이노 전송 (값이 바뀔 때만 보내면 통신 부하 줄임) ---
+        # 하지만 정밀한 리플레이를 위해 매 프레임 기록하거나,
+        # 여기서는 "명령을 보낸 시점"을 기록합니다.
 
-        # ----------------------------------
-        # 3. 화면 오버레이 및 저장
-        # ----------------------------------
-        # 현재 상태를 영상에 글씨로 씀 (나중에 로그 분석할 때 편함)
-        info_text = f"Steer: {steer_text} | Motor: {motor_text}"
-        cv2.putText(frame, info_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX,
-                    1, (0, 255, 0), 2)
+        # 조향 명령
+        if curr_steer != last_steer_val:
+            ser.write(f"S,{curr_steer}\n".encode())
+            last_steer_val = curr_steer
 
-        # 파일 저장
+        # 속도 명령
+        if curr_speed != last_motor_speed:
+            ser.write(f"D,{curr_speed}\n".encode())
+            last_motor_speed = curr_speed
+
+        # --- 3. ★ 데이터 로깅 (핵심) ---
+        # 현재 시간 - 시작 시간 = 경과 시간
+        elapsed_time = round(time.time() - start_time, 3)
+
+        # CSV에 한 줄 저장: [0.123초, 570, 255]
+        csv_writer.writerow([elapsed_time, last_steer_val, last_motor_speed])
+
+        # --- 4. 화면 표시 및 영상 저장 ---
+        cv2.putText(frame, f"Time: {elapsed_time}s", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(frame, f"Cmd: {steer_text} | {motor_text}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
         out.write(frame)
+        cv2.imshow("Recording...", frame)
 
-        # 화면 출력
-        cv2.imshow("Manual Driving & Recording", frame)
-
-        # ----------------------------------
-        # 4. 종료 조건
-        # ----------------------------------
-        # ESC 키를 누르거나, OpenCV 창에서 q를 누르면 종료
         if keyboard.is_pressed('esc') or (cv2.waitKey(1) & 0xFF == ord('q')):
-            print("🛑 프로그램 종료")
-            ser.write(b'D,0\n')  # 모터 정지
-            time.sleep(0.1)
-            ser.write(b'S,570\n')  # 핸들 중앙
             break
 
-        # 루프 속도 조절 (time.sleep 대신 waitKey로 딜레이 대체하여 영상 부드럽게)
-        # cv2.waitKey(1)이 이미 1ms 딜레이 역할을 함
-
 except KeyboardInterrupt:
-    print("\n강제 종료됨")
+    print("종료 중...")
 
 finally:
-    # 자원 해제 (중요)
-    if ser: ser.close()
-    if cap: cap.release()
-    if out: out.release()
+    ser.write(b'D,0\n')
+    ser.write(b'S,570\n')
+    ser.close()
+    cap.release()
+    out.release()
+    csv_file.close()  # ★ 파일 닫기 중요
     cv2.destroyAllWindows()
-    print("💾 저장 완료 및 종료")
+    print("💾 데이터 저장 완료.")
