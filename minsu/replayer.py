@@ -36,7 +36,7 @@ except FileNotFoundError:
     exit()
 
 print(f"🚀 리플레이 시작! (총 {len(commands)}개의 명령)")
-print("⚠️ 비상 정지: ESC 키를 누르세요.")
+print("⚠️ 비상 정지: q 키를 누르세요.")
 
 # 시작 기준 시간
 start_reference = time.time()
@@ -44,7 +44,7 @@ start_reference = time.time()
 try:
     for cmd in commands:
         # 1. 비상 정지 체크
-        if keyboard.is_pressed('esc'):
+        if keyboard.is_pressed('q'):
             print("🛑 비상 정지!")
             break
 
