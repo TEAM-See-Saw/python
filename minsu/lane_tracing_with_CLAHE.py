@@ -5,50 +5,70 @@ import serial
 import time
 
 # ==========================================
-# [1] 환경 및 튜닝 설정
+# [1] 설정값
 # ==========================================
 PORT = 'COM4'
 BAUDRATE = 9600
 SERIAL_DELAY = 0.05
 
 CAM_INDEX = 0
-MAX_SPEED = 200  # 안전 속도
+MAX_SPEED = 200
 SERVO_CENTER = 570
 SERVO_LEFT_MAX = 680
 SERVO_RIGHT_MAX = 480
 
-# 📐 ROI 비율 (황금 비율)
+# ⚙️ [핵심] 자동 튜닝 초기값 및 범위 설정
+current_threshold = 165  # 시작값
+MIN_THRESH = 120  # 이 밑으론 안 내려감 (너무 어두움 방지)
+MAX_THRESH = 230  # 이 위론 안 올라감 (차선까지 지워짐 방지)
+
+# 흰색 픽셀 비율 목표 (전체 화면 중 차선이 차지하는 비중)
+# 보통 차선은 화면의 3% ~ 8% 정도를 차지함
+TARGET_RATIO_MIN = 0.03  # 3% 미만이면 -> 너무 어둡다 (기준 낮춰!)
+TARGET_RATIO_MAX = 0.08  # 8% 초과면 -> 너무 밝다 (기준 높여!)
+
 ROI_HEIGHT_RATIO = 0.6
 ROI_X_LEFT_RATIO = 0.3125
 ROI_X_RIGHT_RATIO = 0.6875
 
-# 🧠 조향 기억 변수 (차선 놓쳤을 때 직전 값 유지용)
 last_target_x = 320
 
-# ⚙️ 자동 튜닝 설정 (Auto-Tuning)
-current_l_min = 140  # 초기 L-Min 값
-MIN_L_VAL = 60  # 최소 밝기 제한
-MAX_L_VAL = 220  # 최대 밝기 제한
-
-TARGET_RATIO_MIN = 0.03  # 최소 흰색 비율 (3%)
-TARGET_RATIO_MAX = 0.10  # 최대 흰색 비율 (10%)
-S_MAX_VAL = 60  # 채도 상한선
-
 # ==========================================
-# [2] 시리얼 연결
+# [2] 초기화
 # ==========================================
 ser = None
 try:
     ser = serial.Serial(PORT, BAUDRATE, timeout=0.1)
-    print(f"✅ {PORT} 포트 연결 성공! (2초 대기)")
     time.sleep(2)
-except Exception as e:
-    print(f"❌ 연결 실패: {e}")
+except:
+    pass
 
 
 # ==========================================
-# [3] 영상 처리 함수
+# [3] 함수 정의
 # ==========================================
+def preprocess_sunlight_lane(frame, threshold_val):
+    """
+    threshold_val을 인자로 받아서 동적으로 적용하는 함수
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # CLAHE (이건 고정해도 됨, 임계값이 더 중요함)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced_gray = clahe.apply(gray)
+
+    blurred = cv2.GaussianBlur(enhanced_gray, (5, 5), 0)
+
+    # ★ 변수로 받은 threshold_val 적용
+    _, binary_img = cv2.threshold(blurred, threshold_val, 255, cv2.THRESH_BINARY)
+
+    kernel = np.ones((3, 3), np.uint8)
+    binary_img = cv2.morphologyEx(binary_img, cv2.MORPH_OPEN, kernel)
+
+    return binary_img
+
+
+# ... (ROI, make_points, average_slope 등 기존 함수 동일 - 생략 가능하면 생략하겠지만 전체 코드 요청시 유지) ...
 def region_of_interest(img, vertices):
     mask = np.zeros_like(img)
     cv2.fillPoly(mask, vertices, 255)
@@ -86,7 +106,6 @@ def average_slope_intercept(image, lines):
 
 def calculate_steering_angle(image, left_line, right_line):
     global last_target_x
-
     height, width = image.shape[:2]
     car_x = width / 2
     target_y = int(height * ROI_HEIGHT_RATIO)
@@ -98,15 +117,12 @@ def calculate_steering_angle(image, left_line, right_line):
     elif right_line is not None:
         target_x = right_line[0][2] - (width * 0.25)
     else:
-        # ★ 조향 기억: 차선을 놓치면 직전 위치 유지
         target_x = last_target_x
 
     last_target_x = target_x
-
     dx = target_x - car_x
     dy = (height - target_y)
-    angle_deg = math.degrees(math.atan2(dx, abs(dy)))
-    return angle_deg, int(target_x)
+    return math.degrees(math.atan2(dx, abs(dy))), int(target_x)
 
 
 def map_value(x, in_min, in_max, out_min, out_max):
@@ -114,10 +130,10 @@ def map_value(x, in_min, in_max, out_min, out_max):
 
 
 # ==========================================
-# [4] 메인 실행
+# [4] 메인 실행 (자동 튜닝 로직 포함)
 # ==========================================
 def main():
-    global current_l_min
+    global current_threshold  # 전역 변수 사용
 
     cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
     width = 640;
@@ -126,13 +142,11 @@ def main():
     cap.set(4, height);
     cap.set(15, -6)
 
-    if not cap.isOpened(): print("❌ 카메라 오류"); return
+    if not cap.isOpened(): return
 
-    print("\n🚀 3초 후 출발 (Auto-Tuning ON)!");
-    for i in range(3, 0, -1): print(f"{i}.."); time.sleep(1)
-
+    print("🚀 Auto-Tuning Drive Start!")
+    time.sleep(3)
     if ser: ser.write(f"D,{MAX_SPEED}\n".encode())
-
     last_serial_time = 0
 
     try:
@@ -143,51 +157,47 @@ def main():
             h, w = frame.shape[:2]
 
             # ------------------------------------------------
-            # 1. HLS 변환 및 마스크 생성 (자동 튜닝)
+            # 1. 자동 튜닝 전처리 (Auto-Tuning)
             # ------------------------------------------------
-            hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
+            # 현재 Threshold 값으로 이미지 처리
+            binary_mask = preprocess_sunlight_lane(frame, current_threshold)
 
-            lower_white = np.array([0, current_l_min, 0])
-            upper_white = np.array([179, 255, S_MAX_VAL])
-
-            mask = cv2.inRange(hls, lower_white, upper_white)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-
-            # ------------------------------------------------
-            # 2. 자동 튜닝 로직 (L_MIN 조절)
-            # ------------------------------------------------
+            # ★ 흰색 픽셀 비율 계산 (ROI 영역만 보는게 정확함)
+            # ROI 영역 마스크 생성
             roi_points = np.array([[
                 (0, h), (w, h),
                 (int(w * ROI_X_RIGHT_RATIO), int(h * ROI_HEIGHT_RATIO)),
                 (int(w * ROI_X_LEFT_RATIO), int(h * ROI_HEIGHT_RATIO))
             ]], dtype=np.int32)
 
-            roi_mask_poly = np.zeros_like(mask)
-            cv2.fillPoly(roi_mask_poly, [roi_points], 255)
-            roi_pixels = cv2.bitwise_and(mask, roi_mask_poly)
+            # 전체 화면 말고 ROI 안쪽만 잘라서 비율 계산 (하늘이나 배경 노이즈 무시)
+            roi_mask = np.zeros_like(binary_mask)
+            cv2.fillPoly(roi_mask, [roi_points], 255)
+            roi_area_pixels = cv2.bitwise_and(binary_mask, roi_mask)
 
-            white_count = cv2.countNonZero(roi_pixels)
-            total_area = cv2.contourArea(roi_points)
-            if total_area == 0: total_area = 1
+            # 흰색 점 개수 세기
+            white_pixels = cv2.countNonZero(roi_area_pixels)
+            total_pixels = cv2.contourArea(roi_points)  # ROI 면적 (대략적)
+            if total_pixels == 0: total_pixels = 1
 
-            ratio = white_count / total_area
+            ratio = white_pixels / total_pixels
 
-            # 흰색 비율에 따라 L_MIN 자동 조절
+            # ★ [핵심] 차선 굵기에 따른 Threshold 자동 조절
+            # 3% ~ 8% 사이를 유지하려고 노력함
             if ratio > TARGET_RATIO_MAX:
-                current_l_min = min(current_l_min + 2, MAX_L_VAL)
+                current_threshold = min(current_threshold + 2, MAX_THRESH)  # 너무 밝으면 기준 올림
             elif ratio < TARGET_RATIO_MIN:
-                current_l_min = max(current_l_min - 2, MIN_L_VAL)
+                current_threshold = max(current_threshold - 2, MIN_THRESH)  # 너무 어두우면 기준 낮춤
 
             # ------------------------------------------------
-            # 3. 라인 검출 및 주행
+            # 2. 이후 로직은 동일
             # ------------------------------------------------
-            edges = cv2.Canny(mask, 50, 150)
+            edges = cv2.Canny(binary_mask, 50, 150)
             cropped = region_of_interest(edges, roi_points)
             lines = cv2.HoughLinesP(cropped, 1, np.pi / 180, 50, minLineLength=40, maxLineGap=100)
-
             left, right = average_slope_intercept(frame, lines)
-            angle, target = calculate_steering_angle(frame, left, right)
 
+            angle, target = calculate_steering_angle(frame, left, right)
             servo_val = int(map_value(max(-45, min(45, angle)), -45, 45, SERVO_LEFT_MAX, SERVO_RIGHT_MAX))
 
             if ser and (time.time() - last_serial_time > SERIAL_DELAY):
@@ -195,44 +205,32 @@ def main():
                 last_serial_time = time.time()
 
             # ------------------------------------------------
-            # 4. 디스플레이
+            # 3. 디스플레이 (튜닝 상태 표시)
             # ------------------------------------------------
-            mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            mask_bgr = cv2.cvtColor(binary_mask, cv2.COLOR_GRAY2BGR)
             cv2.polylines(frame, [roi_points], True, (255, 0, 0), 2)
             cv2.circle(frame, (target, int(h * ROI_HEIGHT_RATIO)), 10, (0, 0, 255), -1)
 
             combined = np.hstack((frame, mask_bgr))
 
-            info_text = f"L-Min: {current_l_min} | Ratio: {ratio * 100:.1f}%"
-            color = (0, 255, 0)
+            # ★ 현재 튜닝 상태 출력 (이걸 보면 됨)
+            info_text = f"Thresh: {current_threshold} | White Ratio: {ratio * 100:.1f}%"
+            status_color = (0, 255, 0)  # 정상 (초록)
             if ratio > TARGET_RATIO_MAX:
-                color = (0, 0, 255)
+                status_color = (0, 0, 255)  # 너무 밝음 (빨강)
             elif ratio < TARGET_RATIO_MIN:
-                color = (0, 255, 255)
+                status_color = (0, 255, 255)  # 너무 어두움 (노랑)
 
-            cv2.putText(combined, info_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            cv2.imshow("Auto-Tuning Drive", combined)
+            cv2.putText(combined, info_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+            cv2.imshow("Auto-Tuning Lane Keep", combined)
 
             if cv2.waitKey(1) == ord('q'): break
 
     except Exception as e:
-        print(f"❌ 오류 발생: {e}")
-
-    # ========================================================
-    # ★ [핵심] 안전 정지 로직 (프로그램 종료 시 무조건 실행)
-    # ========================================================
+        print(e)
     finally:
-        print("\n🛑 안전 정지 시퀀스 작동 (Emergency Stop)")
-        if ser:
-            # 혹시 모를 통신 누락 방지를 위해 3번 반복 전송
-            for _ in range(3):
-                ser.write(b"D,0\n")  # 모터 끄기
-                ser.write(b"S,570\n")  # 핸들 중앙
-                time.sleep(0.05)  # 아두이노 수신 대기
-            ser.close()
-            print("✅ 차량 정지 완료 및 포트 닫힘")
-
-        cap.release()
+        if ser: ser.write(b"D,0\n"); ser.write(b"S,570\n"); ser.close()
+        cap.release();
         cv2.destroyAllWindows()
 
 
