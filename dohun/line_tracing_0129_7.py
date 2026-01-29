@@ -3,11 +3,7 @@ import numpy as np
 import math
 import serial
 import time
-import datetime
 
-# ==========================================
-# [1] 설정
-# ==========================================
 CAM_INDEX = 0
 PORT = 'COM4'
 BAUDRATE = 9600
@@ -16,8 +12,13 @@ SERVO_LEFT_MAX = 680
 SERVO_RIGHT_MAX = 480
 MAX_SPEED = 255
 
-# 밝기 최소값 (L)
-L_MIN = 170
+# ===============================
+# FHD 튜닝값 → 640x480 변환 결과
+# ===============================
+ROI_TOP_WIDTH = 320     # 960 * (640 / 1920)
+ROI_TOP_Y = 178         # 401 * (480 / 1080)
+ROI_BOTTOM_Y = 469      # 1057 * (480 / 1080)
+L_MIN = 169
 
 try:
     ser = serial.Serial(PORT, BAUDRATE, timeout=1)
@@ -54,34 +55,32 @@ def average_slope_intercept(image, lines):
         return None, None
     for line in lines:
         for x1, y1, x2, y2 in line:
-            fit = np.polyfit((x1, x2), (y1, y2), 1)
-            slope = fit[0]
-            intercept = fit[1]
+            slope, intercept = np.polyfit((x1, x2), (y1, y2), 1)
             if slope < -0.5:
                 left_fit.append((slope, intercept))
             elif slope > 0.5:
                 right_fit.append((slope, intercept))
-    left_line = make_points(image, np.mean(left_fit, axis=0)) if len(left_fit) > 0 else None
-    right_line = make_points(image, np.mean(right_fit, axis=0)) if len(right_fit) > 0 else None
+    left_line = make_points(image, np.mean(left_fit, axis=0)) if left_fit else None
+    right_line = make_points(image, np.mean(right_fit, axis=0)) if right_fit else None
     return left_line, right_line
 
 
 def calculate_steering_angle(image, left_line, right_line):
     height, width, _ = image.shape
-    car_position_x = width / 2
+    car_x = width / 2
     if left_line is not None and right_line is not None:
         target_x = (left_line[0][2] + right_line[0][2]) / 2
     elif left_line is not None:
-        target_x = left_line[0][2] + (width * 0.25)
+        target_x = left_line[0][2] + width * 0.25
     elif right_line is not None:
-        target_x = right_line[0][2] - (width * 0.25)
+        target_x = right_line[0][2] - width * 0.25
     else:
-        target_x = car_position_x
+        target_x = car_x
 
-    dx = target_x - car_position_x
-    dy = (height * 0.6) - height
-    angle_deg = math.degrees(math.atan2(dx, abs(dy)))
-    return angle_deg, int(target_x)
+    dx = target_x - car_x
+    dy = height * 0.6 - height
+    angle = math.degrees(math.atan2(dx, abs(dy)))
+    return angle, int(target_x)
 
 
 def map_value(x, in_min, in_max, out_min, out_max):
@@ -93,15 +92,8 @@ def main():
     cap.set(3, 640)
     cap.set(4, 480)
 
-    # 자동 노출 / 자동 화이트밸런스
-    try:
-        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
-    except:
-        pass
-    try:
-        cap.set(cv2.CAP_PROP_AUTO_WB, 1)
-    except:
-        pass
+    if ser:
+        ser.write(f"D,{MAX_SPEED}\n".encode())
 
     while True:
         ret, frame = cap.read()
@@ -109,30 +101,27 @@ def main():
             break
 
         hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
-
-        # L: 180 이상, S는 전체 허용
-        lower_white = np.array([0, L_MIN, 0])
-        upper_white = np.array([179, 255, 255])
+        lower_white = np.array([0, L_MIN, 0], dtype=np.uint8)
+        upper_white = np.array([179, 255, 255], dtype=np.uint8)
         mask = cv2.inRange(hls, lower_white, upper_white)
 
-        kernel = np.ones((3, 3), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         edges = cv2.Canny(mask, 50, 150)
 
-        height, width = edges.shape
+        h, w = edges.shape
+        cx = w // 2
         roi_vertices = [
-            (0, height),
-            (width // 2 - 50, int(height * 0.6)),
-            (width // 2 + 50, int(height * 0.6)),
-            (width, height)
+            (0, ROI_BOTTOM_Y),
+            (cx - ROI_TOP_WIDTH, ROI_TOP_Y),
+            (cx + ROI_TOP_WIDTH, ROI_TOP_Y),
+            (w, ROI_BOTTOM_Y)
         ]
-        cropped = region_of_interest(edges, np.array([roi_vertices], np.int32))
 
-        lines = cv2.HoughLinesP(cropped, 1, np.pi / 180, 50,
-                                minLineLength=40, maxLineGap=100)
+        cropped = region_of_interest(edges, np.array([roi_vertices], np.int32))
+        lines = cv2.HoughLinesP(cropped, 1, np.pi / 180, 50, 40, 100)
+
         left, right = average_slope_intercept(frame, lines)
-        angle, target = calculate_steering_angle(frame, left, right)
+        angle, _ = calculate_steering_angle(frame, left, right)
 
         servo = int(map_value(max(-45, min(45, angle)),
                               -45, 45,
@@ -140,10 +129,10 @@ def main():
         if ser:
             ser.write(f"S,{servo}\n".encode())
 
-        mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        combined = np.hstack((frame, mask_bgr))
-        cv2.imshow("Original vs Mask", combined)
+        # ROI 시각화
+        cv2.polylines(frame, [np.array(roi_vertices, np.int32)], True, (0, 255, 0), 2)
 
+        cv2.imshow("ROI Visualization (640x480)", frame)
         if cv2.waitKey(1) == ord('q'):
             break
 
