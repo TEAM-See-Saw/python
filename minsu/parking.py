@@ -2,41 +2,50 @@ import serial
 from rplidar import RPLidar
 import time
 import numpy as np
+import cv2
 
 # ==========================================
 # [1] 설정값
 # ==========================================
-PORT = 'COM4'  # 아두이노
-LIDAR_PORT = 'COM3'  # 라이다
+PORT = 'COM4'
+LIDAR_PORT = 'COM3'
 
 # 속도 설정
 SPEED_SEARCH = 80
-SPEED_PARK = 90
+SPEED_PARK = 75  # 천천히 후진
 SPEED_STOP = 0
 
-# 서보 설정
+# 서보 설정 (DC 조향 모터 특성 반영)
 SERVO_CENTER = 570
-SERVO_RIGHT_MAX = 480  # 우측 주차 진입용
+SERVO_RIGHT_MAX = 440  # 우측 최대 (가장 많이 꺾임)
 SERVO_LEFT_MAX = 680
 
-# 거리 기준 (mm)
-PARKING_DEPTH = 1000  # 빈 공간 판단 (1m 이상)
-REAR_LIMIT = 200  # 후방 벽 비상 정지 (20cm)
+# 조향 대기 시간 (핸들 돌릴 때 모터 멈춰있는 시간)
+STEER_WAIT_TIME = 0.8
 
-# ★ [핵심] 앞선 맞추기 기준
-# 옆 차와의 간격 (이 거리 안으로 들어오면 "옆에 차가 있구나" 판단)
-SIDE_CAR_DIST = 800  # 80cm 이내에 물체가 있으면 감지
+# 거리 기준
+CAR_DIST_MIN = 150
+CAR_DIST_MAX = 1200
+EMPTY_DIST_MIN = 1200
+SIDE_CAR_DIST = 800
+REAR_LIMIT = 200
+PASS_CAR_WIDTH_DELAY = 1.5
 
-# 아두이노 센서 인덱스 (LF, LM, LT, RF, RM, RT)
-IDX_LT = 2  # 왼쪽 뒤
-IDX_RT = 5  # 오른쪽 뒤
+# 아두이노 센서 인덱스
+IDX_LT = 2
+IDX_RT = 5
 
 # 상태 정의
 STATE_SEARCH = 0
-STATE_POSITION = 1
-STATE_REVERSE_TURN = 2
-STATE_REVERSE_STRAIGHT = 3
-STATE_DONE = 4
+STATE_REVERSE_TURN = 1
+STATE_REVERSE_STRAIGHT = 2
+STATE_DONE = 3
+
+# 탐색 단계
+STEP_INIT_EMPTY = 0
+STEP_PASSING_CAR1 = 1
+STEP_FIND_SPOT = 2
+STEP_FIND_CAR2 = 3
 
 # ==========================================
 # [2] 데이터 처리 함수
@@ -58,22 +67,14 @@ def read_sensors():
 
 
 def get_lidar_dist_at_angle(scan, target_angle, angle_range=2):
-    """
-    특정 각도(target_angle) 주변의 물체 거리를 반환
-    예: 90도라고 하면 88~92도 사이의 평균 거리를 구함
-    """
     dists = []
     min_a = target_angle - angle_range
     max_a = target_angle + angle_range
-
     for (_, angle, dist) in scan:
-        if dist > 0:
-            if min_a <= angle <= max_a:
-                dists.append(dist)
-
-    if len(dists) > 0:
-        return np.mean(dists)
-    return 9999  # 감지 안됨
+        if dist > 0 and (min_a <= angle <= max_a):
+            dists.append(dist)
+    if len(dists) > 0: return np.mean(dists)
+    return 9999
 
 
 # ==========================================
@@ -81,6 +82,8 @@ def get_lidar_dist_at_angle(scan, target_angle, angle_range=2):
 # ==========================================
 def main():
     global ser, lidar
+
+    cv2.namedWindow("Parking Monitor")
 
     try:
         ser = serial.Serial(PORT, 9600, timeout=0.1)
@@ -92,115 +95,142 @@ def main():
         return
 
     state = STATE_SEARCH
+    search_step = STEP_INIT_EMPTY
     state_timer = 0
-    spot_found_time = 0
+    car1_detect_time = 0
 
-    print("🚀 주차 시스템 시작: 라이다 90도 정렬 모드")
+    print("🚀 주차 시스템 시작: DC 조향 전압 집중 모드")
 
     try:
         for scan in lidar.iter_scans():
-            # 1. 데이터 읽기
             read_sensors()
-
-            # 라이다 데이터 추출
-            # 우측 주차 공간 탐색용 (넓은 범위 80~100도)
-            lidar_search_right = get_lidar_dist_at_angle(scan, 90, 10)
-
-            # ★ 정렬용: 정확히 90도(우측) 핀포인트
-            lidar_align_right = get_lidar_dist_at_angle(scan, 90, 2)
-
-            # 후방 초음파
+            lidar_search = get_lidar_dist_at_angle(scan, 90, 5)
+            lidar_align = get_lidar_dist_at_angle(scan, 90, 2)
             dist_LT = sonar_data[IDX_LT]
             dist_RT = sonar_data[IDX_RT]
 
-            # 명령 변수
             cmd_speed = 0
             cmd_servo = SERVO_CENTER
             curr_time = time.time()
             msg = ""
 
             # ---------------------------------------------------
-            # [1] 빈 공간 탐색
+            # [1] 탐색 (직진)
             # ---------------------------------------------------
             if state == STATE_SEARCH:
                 cmd_speed = SPEED_SEARCH
-                msg = f"SEARCHING... Dist: {int(lidar_search_right)}mm"
+                cmd_servo = SERVO_CENTER  # 직진 유지
+                msg = f"STEP: {search_step} | Dist: {int(lidar_search)}mm"
 
-                if lidar_search_right > PARKING_DEPTH:
-                    if spot_found_time == 0:
-                        spot_found_time = curr_time
-                    elif curr_time - spot_found_time > 1.5:
-                        print("✅ 빈 주차 공간 발견!")
-                        state = STATE_POSITION
-                        state_timer = curr_time
-                else:
-                    spot_found_time = 0
+                if search_step == STEP_INIT_EMPTY:
+                    if CAR_DIST_MIN <= lidar_search <= CAR_DIST_MAX:
+                        print(f"🚗 [1/4] 차량 발견!")
+                        car1_detect_time = curr_time
+                        search_step = STEP_PASSING_CAR1
+
+                elif search_step == STEP_PASSING_CAR1:
+                    msg = "PASSING CAR 1..."
+                    if curr_time - car1_detect_time > PASS_CAR_WIDTH_DELAY:
+                        print("👀 [2/4] 빈 공간 탐색 시작")
+                        search_step = STEP_FIND_SPOT
+
+                elif search_step == STEP_FIND_SPOT:
+                    if lidar_search > EMPTY_DIST_MIN:
+                        msg = "SPOT FOUND! Looking for Car 2..."
+
+                    if CAR_DIST_MIN <= lidar_search <= CAR_DIST_MAX:
+                        print(f"🛑 [3/4] 두 번째 차 감지 -> 정지")
+
+                        # 브레이크
+                        ser.write(b"D,-100\n");
+                        time.sleep(0.1)
+                        for _ in range(5): ser.write(b"D,0\n"); time.sleep(0.05)
+
+                        print("🛑 정차 및 기어 변경 대기...")
+                        time.sleep(1.0)
+
+                        state = STATE_REVERSE_TURN
+                        state_timer = time.time()
 
             # ---------------------------------------------------
-            # [2] 위치 잡기 (전진)
-            # ---------------------------------------------------
-            elif state == STATE_POSITION:
-                cmd_speed = SPEED_SEARCH
-                msg = "POSITIONING..."
-                if curr_time - state_timer > 1.2:
-                    ser.write(b"D,0\n");
-                    time.sleep(1)
-                    state = STATE_REVERSE_TURN
-                    state_timer = curr_time
-
-            # ---------------------------------------------------
-            # [3] 꺾어서 후진
+            # [2] 꺾어서 후진 (Stop & Steer)
             # ---------------------------------------------------
             elif state == STATE_REVERSE_TURN:
-                cmd_speed = -SPEED_PARK
+                # 1. 목표: 우측 최대 꺾기
                 cmd_servo = SERVO_RIGHT_MAX
-                msg = "TURNING BACK..."
 
-                # 비상 정지
+                # 2. [전압 집중] 0.8초간 정지 후 핸들링
+                if curr_time - state_timer < STEER_WAIT_TIME:
+                    cmd_speed = 0
+                    msg = "⚡ TURNING WHEELS (RIGHT)..."
+                else:
+                    # 0.8초 후 출발
+                    cmd_speed = -SPEED_PARK
+                    msg = "REVERSING (TURN)..."
+
                 if dist_LT < REAR_LIMIT or dist_RT < REAR_LIMIT:
                     state = STATE_DONE
 
-                if curr_time - state_timer > 2.5:
+                # 3.5초 후 다음 단계 (시간 넉넉히)
+                if curr_time - state_timer > 3.5:
+                    # ★ 단계 넘어갈 때 타이머 리셋 필수
                     state = STATE_REVERSE_STRAIGHT
+                    state_timer = time.time()
 
-            # ---------------------------------------------------
-            # [4] 직진 후진 & ★ 라이다 90도 정렬
+                    # ---------------------------------------------------
+            # [3] 풀고 직진 후진 (Stop & Steer) - ★ 여기도 적용됨
             # ---------------------------------------------------
             elif state == STATE_REVERSE_STRAIGHT:
-                cmd_speed = -SPEED_PARK
+                # 1. 목표: 중앙 정렬 (핸들 풀기)
                 cmd_servo = SERVO_CENTER
-                msg = f"ALIGNING (90deg)... Dist: {int(lidar_align_right)}mm"
 
-                # 1. 후방 벽 충돌 방지
+                # 2. [전압 집중] 0.8초간 정지 후 핸들 복귀
+                # 우측으로 꺾여있던 핸들을 중앙으로 돌릴 때 전기를 많이 씀 -> 멈춰서 돌림
+                if curr_time - state_timer < STEER_WAIT_TIME:
+                    cmd_speed = 0
+                    msg = "⚡ REALIGNING WHEELS (CENTER)..."
+                else:
+                    # 핸들 다 풀렸으면 후진
+                    cmd_speed = -SPEED_PARK
+                    msg = f"ALIGNING... Dist: {int(lidar_align)}"
+
                 if dist_LT < REAR_LIMIT or dist_RT < REAR_LIMIT:
                     print("🛑 후방 벽 감지 -> 완료")
                     state = STATE_DONE
 
-                # 2. ★ 라이다 90도 감지 시 정지 (앞선 맞추기)
-                # 내 차가 뒤로 들어가다가, 90도 방향(옆)에 차가 감지되면(80cm 이내) 정지
-                elif lidar_align_right < SIDE_CAR_DIST:
-                    print(f"✅ 옆 차 감지 (90도: {int(lidar_align_right)}mm) -> 라인 정렬 완료")
+                elif lidar_align < SIDE_CAR_DIST:
+                    print(f"✅ 정렬 완료 (옆 차: {int(lidar_align)}mm)")
                     state = STATE_DONE
 
             # ---------------------------------------------------
-            # [5] 완료
+            # [4] 주차 완료
             # ---------------------------------------------------
             elif state == STATE_DONE:
                 cmd_speed = 0
-                msg = "PARKING DONE"
+                msg = "PARKING COMPLETED"
                 ser.write(b"D,0\n")
-                print(msg)
                 break
 
+            # 명령 전송
             ser.write(f"S,{cmd_servo}\n".encode())
             ser.write(f"D,{cmd_speed}\n".encode())
-            print(f"[{state}] {msg}")
+
+            # 디버그 화면
+            debug_img = np.zeros((200, 600, 3), dtype=np.uint8)
+            cv2.putText(debug_img, f"State: {state} Step: {search_step}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                        (255, 255, 255), 2)
+            cv2.putText(debug_img, msg, (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.imshow("Parking Monitor", debug_img)
+
+            if cv2.waitKey(1) == ord('q'):
+                break
 
     except KeyboardInterrupt:
         print("종료")
     finally:
         if ser: ser.write(b"D,0\n"); ser.close()
         if lidar: lidar.stop(); lidar.disconnect()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
