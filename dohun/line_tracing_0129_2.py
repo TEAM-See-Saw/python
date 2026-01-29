@@ -11,45 +11,33 @@ import os
 # ==========================================
 IS_SUNNY = False  # True: 햇빛 강함, False: 실내/흐림
 
-# ⚙️ 통신 설정
-PORT = 'COM4'  # 아두이노 포트 확인
+PORT = 'COM4'
 BAUDRATE = 9600
-SERIAL_DELAY = 0.05  # ★ 멈춤 방지: 0.05초마다 명령 전송
+SERIAL_DELAY = 0.05
 
-# 📷 카메라 및 주행 설정
 CAM_INDEX = 0
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
-MAX_SPEED = 255  # 주행 속도 (0~255)
+MAX_SPEED = 255
 
-# 📐 서보 모터 설정
 SERVO_CENTER = 570
 SERVO_LEFT_MAX = 680
 SERVO_RIGHT_MAX = 480
 
-# 🖼️ ROI (관심 영역) 설정 - 카메라 각도 대응 ★
-# 0.0(맨위) ~ 1.0(맨아래)
-# 카메라를 들었으므로, 위쪽 50%는 잘라내서 신호등/배경 간섭을 막음
 ROI_Y_TOP_RATIO = 0.5
 ROI_Y_BOTTOM_RATIO = 1.0
-ROI_X_MARGIN = 50  # 사다리꼴 윗변 여백
+ROI_X_MARGIN = 50
 
-# 영상 처리 임계값 (모드별 자동 설정)
 if IS_SUNNY:
     EXPOSURE = -9
-    L_MIN = 160
-    S_MAX = 50
+    L_MIN = 150   # CLAHE 쓰니까 너무 높게 안 잡아도 됨
+    S_MAX = 70
     MORPH_SIZE = (5, 5)
 else:
     EXPOSURE = -4
-    L_MIN = 100
-    S_MAX = 60
+    L_MIN = 110
+    S_MAX = 80
     MORPH_SIZE = (3, 3)
-
-# 동적 임계값 초기값
-L_MIN_DYNAMIC = float(L_MIN)
-S_MAX_DYNAMIC = float(S_MAX)
-ALPHA = 0.9  # 0~1, 높을수록 천천히 변함
 
 # ==========================================
 # [2] 하드웨어 연결
@@ -77,7 +65,7 @@ def make_points(image, line_parameters):
         return None
     slope, intercept = line_parameters
     y1 = image.shape[0]
-    y2 = int(y1 * ROI_Y_TOP_RATIO)  # ROI 상단까지만 선 그리기
+    y2 = int(y1 * ROI_Y_TOP_RATIO)
     if slope == 0:
         slope = 0.001
     x1 = int((y1 - intercept) / slope)
@@ -108,7 +96,6 @@ def average_slope_intercept(image, lines):
 def calculate_steering_angle(image, left_line, right_line):
     height, width, _ = image.shape
     car_x = width / 2
-
     target_y = int(height * ROI_Y_TOP_RATIO)
 
     if left_line is not None and right_line is not None:
@@ -131,34 +118,10 @@ def map_value(x, in_min, in_max, out_min, out_max):
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
 
 
-def update_thresholds(hls, roi_vertices, prev_L_MIN, prev_S_MAX):
-    L = hls[:, :, 1]
-    S = hls[:, :, 2]
-
-    mask = np.zeros_like(L, dtype=np.uint8)
-    cv2.fillPoly(mask, roi_vertices, 255)
-
-    roi_L = L[mask > 0]
-    roi_S = S[mask > 0]
-
-    if roi_L.size == 0 or roi_S.size == 0:
-        return prev_L_MIN, prev_S_MAX
-
-    p75_L = np.percentile(roi_L, 75)
-    p75_S = np.percentile(roi_S, 75)
-
-    new_L_MIN = np.clip(p75_L * 0.7, 60, 200)
-    new_S_MAX = np.clip(p75_S * 1.1, 40, 120)
-
-    return new_L_MIN, new_S_MAX
-
-
 # ==========================================
 # [4] 메인 실행
 # ==========================================
 def main():
-    global L_MIN_DYNAMIC, S_MAX_DYNAMIC
-
     cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
@@ -168,7 +131,6 @@ def main():
         print("❌ 카메라 오류")
         return
 
-    # 녹화 파일 설정
     if not os.path.exists('dataset'):
         os.makedirs('dataset')
     filename = f"dataset/line_trace_{datetime.datetime.now().strftime('%H%M%S')}.mp4"
@@ -180,6 +142,9 @@ def main():
     print("🚀 출발!")
     if ser:
         ser.write(f"D,{MAX_SPEED}\n".encode())
+
+    # CLAHE 객체 미리 생성
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
     try:
         while True:
@@ -195,23 +160,32 @@ def main():
                 (w // 2 - ROI_X_MARGIN, int(h * ROI_Y_TOP_RATIO))
             ]], dtype=np.int32)
 
-            hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
+            # 1. 밝기 정규화 + HLS
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            eq = clahe.apply(gray)
+            frame_eq = cv2.cvtColor(eq, cv2.COLOR_GRAY2BGR)
+            hls = cv2.cvtColor(frame_eq, cv2.COLOR_BGR2HLS)
 
-            new_L, new_S = update_thresholds(hls, roi_points, L_MIN_DYNAMIC, S_MAX_DYNAMIC)
-            L_MIN_DYNAMIC = ALPHA * L_MIN_DYNAMIC + (1 - ALPHA) * new_L
-            S_MAX_DYNAMIC = ALPHA * S_MAX_DYNAMIC + (1 - ALPHA) * new_S
-
+            # 2. inRange로 차선 추출
             mask = cv2.inRange(
                 hls,
-                np.array([0, int(L_MIN_DYNAMIC), 0]),
-                np.array([179, 255, int(S_MAX_DYNAMIC)])
+                np.array([0, L_MIN, 0]),
+                np.array([179, 255, S_MAX])
             )
+
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones(MORPH_SIZE, np.uint8))
             edges = cv2.Canny(mask, 50, 150)
 
             cropped = region_of_interest(edges, roi_points)
 
-            lines = cv2.HoughLinesP(cropped, 1, np.pi / 180, 50, minLineLength=40, maxLineGap=100)
+            lines = cv2.HoughLinesP(
+                cropped,
+                1,
+                np.pi / 180,
+                50,
+                minLineLength=40,
+                maxLineGap=100
+            )
             left, right = average_slope_intercept(frame, lines)
 
             angle, target_x = calculate_steering_angle(frame, left, right)
@@ -232,7 +206,7 @@ def main():
             combined = np.hstack((frame, mask_bgr))
             cv2.putText(
                 combined,
-                f"Angle: {int(angle)} | Servo: {servo_val} | L_MIN: {int(L_MIN_DYNAMIC)} | S_MAX: {int(S_MAX_DYNAMIC)}",
+                f"Angle:{int(angle)} Servo:{servo_val} L_MIN:{L_MIN} S_MAX:{S_MAX}",
                 (20, 50),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
