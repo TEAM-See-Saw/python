@@ -17,7 +17,7 @@ SERVO_RIGHT_MAX = 480
 MAX_SPEED = 255
 
 # 밝기 최소값 (L)
-L_MIN = 180
+L_MIN = 170
 
 try:
     ser = serial.Serial(PORT, BAUDRATE, timeout=1)

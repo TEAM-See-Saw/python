@@ -11,6 +11,12 @@ import os
 # ==========================================
 IS_SUNNY = True
 
+# ★ [핵심] 카메라 각도에 따른 ROI 높이 비율 설정
+# 0.6 = 기본 (카메라가 많이 숙여진 상태)
+# 0.7 ~ 0.8 = 카메라를 들어 올린 상태 (도로가 화면 아래쪽에 깔림)
+ROI_HEIGHT_RATIO = 0.65
+ROI_TOP_WIDTH = 100  # 상단 ROI 너비 (기본 50 -> 각도 올리면 80~100 추천)
+
 # ⚙️ 모터/서보 설정
 PORT = 'COM4'
 BAUDRATE = 9600
@@ -20,20 +26,25 @@ MAX_SPEED = 255
 SERVO_CENTER = 570
 SERVO_LEFT_MAX = 680
 SERVO_RIGHT_MAX = 480
-
-# ★ [수정 1] 시리얼 통신 딜레이 설정 (0.05초 = 50ms)
-# 이 시간 간격으로만 명령을 보냅니다. (멈춤 방지 핵심)
 SERIAL_DELAY = 0.05
 
 # ==========================================
 # [2] 모드별 자동 튜닝값 적용
 # ==========================================
 if IS_SUNNY:
-    print(f"☀️ [모드: SUNNY] 강력한 햇빛 대응 설정 적용")
-    EXPOSURE = -9
-    L_MIN = 160
+    print(f"☀️ [모드: SUNNY] 설정 완화 적용")
+    # 1. 노출을 너무 어둡지 않게 조금 올림 (-9, -7 -> -6 or -5)
+    EXPOSURE = -5
+
+    # 2. 밝기 기준을 대폭 낮춤 (160 -> 120)
+    # 화면이 어두워지면 흰색 차선도 회색이 되므로 기준을 낮춰야 잡힙니다.
+    L_MIN = 120
+
+    # 채도 기준은 유지 (노란색/유색 바닥 무시)
     S_MAX = 50
-    MORPH_SIZE = (5, 5)
+
+    # 3. 노이즈 제거를 조금 약하게 (선이 얇아서 사라지는 것 방지)
+    MORPH_SIZE = (3, 3)
 else:
     print(f"🌙 [모드: NORMAL] 저녁/실내 설정 적용")
     EXPOSURE = -4
@@ -46,7 +57,6 @@ else:
 # ==========================================
 ser = None
 try:
-    # ★ [수정 2] timeout을 0.1로 짧게 설정
     ser = serial.Serial(PORT, BAUDRATE, timeout=0.1)
     print(f"✅ {PORT} 포트 연결 성공! (2초 대기)")
     time.sleep(2)
@@ -56,7 +66,7 @@ except Exception as e:
 
 
 # ==========================================
-# [4] 영상 처리 함수들 (기존과 동일)
+# [4] 영상 처리 함수들
 # ==========================================
 def region_of_interest(img, vertices):
     mask = np.zeros_like(img)
@@ -70,7 +80,8 @@ def make_points(image, line_parameters):
     except TypeError:
         return None
     y1 = image.shape[0]
-    y2 = int(y1 * 0.6)
+    # ★ 수정됨: 전역 변수 사용
+    y2 = int(y1 * ROI_HEIGHT_RATIO)
     if slope == 0: slope = 0.001
     x1 = int((y1 - intercept) / slope)
     x2 = int((y2 - intercept) / slope)
@@ -109,7 +120,8 @@ def calculate_steering_angle(image, left_line, right_line):
         target_x = car_position_x
 
     dx = target_x - car_position_x
-    dy = (height * 0.6) - height
+    # ★ 수정됨: 전역 변수 사용 (높이 비율 반영)
+    dy = (height * ROI_HEIGHT_RATIO) - height
     angle_deg = math.degrees(math.atan2(dx, abs(dy)))
     return angle_deg, int(target_x)
 
@@ -146,7 +158,6 @@ def main():
     out = cv2.VideoWriter(filename, fourcc, fps, (width * 2, height))
     print(f"🎥 녹화 준비 완료: {filename}")
 
-    # 카운트다운
     print("\n" + "=" * 30)
     print(f"🚀 {MAX_SPEED} 속도로 출발합니다!")
     print("=" * 30)
@@ -155,12 +166,10 @@ def main():
         time.sleep(1)
     print("GO!!!")
 
-    # 출발 명령
     if ser:
         ser.write(f"D,{MAX_SPEED}\n".encode())
         time.sleep(0.1)
 
-    # ★ [수정 3] 통신 타이머 초기화
     last_serial_time = 0
 
     while True:
@@ -170,7 +179,6 @@ def main():
         if frame.shape[1] != width or frame.shape[0] != height:
             frame = cv2.resize(frame, (width, height))
 
-        # 영상 처리 파이프라인
         hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
         lower_white = np.array([0, L_MIN, 0])
         upper_white = np.array([179, 255, S_MAX])
@@ -178,11 +186,16 @@ def main():
 
         kernel = np.ones(MORPH_SIZE, np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-
         edges = cv2.Canny(mask, 50, 150)
 
-        roi_vertices = [(0, height), (width // 2 - 50, int(height * 0.6)), (width // 2 + 50, int(height * 0.6)),
-                        (width, height)]
+        # ★ 수정됨: 전역 변수 ROI_HEIGHT_RATIO와 ROI_TOP_WIDTH 사용
+        roi_y = int(height * ROI_HEIGHT_RATIO)
+        roi_vertices = [
+            (0, height),
+            (width // 2 - ROI_TOP_WIDTH, roi_y),
+            (width // 2 + ROI_TOP_WIDTH, roi_y),
+            (width, height)
+        ]
         cropped = region_of_interest(edges, np.array([roi_vertices], np.int32))
 
         lines = cv2.HoughLinesP(cropped, 1, np.pi / 180, 50, minLineLength=40, maxLineGap=100)
@@ -191,19 +204,17 @@ def main():
         angle, target = calculate_steering_angle(frame, left, right)
         servo_val = int(map_value(max(-45, min(45, angle)), -45, 45, SERVO_LEFT_MAX, SERVO_RIGHT_MAX))
 
-        # ==========================================================
-        # ★ [수정 4] 시리얼 통신 최적화 (가장 중요한 부분)
-        # ==========================================================
         current_time = time.time()
-
-        # 이전 전송으로부터 SERIAL_DELAY(0.05초) 이상 지났을 때만 전송
         if ser and (current_time - last_serial_time > SERIAL_DELAY):
             ser.write(f"S,{servo_val}\n".encode())
-            last_serial_time = current_time  # 타이머 갱신
+            last_serial_time = current_time
 
-        # 화면 디버깅
         mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         combined = np.hstack((frame, mask_bgr))
+
+        # 화면에 ROI 선 그리기 (디버깅용)
+        cv2.polylines(combined, [np.array(roi_vertices)], True, (0, 255, 255), 2)
+
         info_text = f"Mode: {'SUNNY' if IS_SUNNY else 'NORMAL'} | Servo: {servo_val}"
         cv2.putText(combined, info_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
