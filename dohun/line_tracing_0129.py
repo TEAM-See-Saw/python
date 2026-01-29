@@ -129,7 +129,7 @@ def main():
         
         # [핵심] 조명에 따른 동적 임계값 설정
         # 너무 밝으면 기준을 높이고, 어두우면 낮춤
-        dynamic_l_min = int(avg_brightness + 45) 
+        dynamic_l_min = int(avg_brightness + 30)
         dynamic_l_min = max(90, min(dynamic_l_min, 210)) # 범위 제한
 
         # 2. 흰색 필터링 (채도 S를 낮게 잡아 색상 노이즈 차단)
