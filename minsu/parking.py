@@ -142,7 +142,7 @@ def main():
                         print(f"🛑 [3/4] 두 번째 차 감지 -> 정지")
 
                         # 브레이크
-                        ser.write(b"D,-100\n");
+                        ser.write(b"D,-100\n")
                         time.sleep(0.1)
                         for _ in range(5): ser.write(b"D,0\n"); time.sleep(0.05)
 
