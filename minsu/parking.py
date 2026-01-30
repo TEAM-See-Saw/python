@@ -20,20 +20,25 @@ SPEED_STOP = 0
 SERVO_CENTER = 570
 SERVO_RIGHT_MAX = 440  # 값 감소 -> 우측
 SERVO_LEFT_MAX = 680  # 값 증가 -> 좌측
-STEER_WAIT_TIME = 0.8
+STEER_WAIT_TIME = 0.8  # 정지 후 핸들 돌리는 시간
 
 # ★ [자세 제어 튜닝] 평행 주행 설정
-# 라이다 90도 기준, 앞쪽(80도)과 뒤쪽(100도)을 비교
-ALIGN_KP = 0.4  # 보정 강도 (크면 확확 꺾고, 작으면 부드럽게)
-MAX_ALIGN_ANGLE = 40  # 최대 보정 범위 (중앙 +-40도 까지만 꺾음)
+ALIGN_KP = 0.4
+MAX_ALIGN_ANGLE = 40
 
 # [시간 튜닝] 7.7Hz 라이다
 CNT_GAP_CONFIRM = 4
 CNT_CAR2_DETECT = 2
-TIME_SETUP_MOVE = 2.5
+
+# ★ [동작 시간 튜닝] (요청하신 부분)
+# 1. 공간 확보 (왼쪽 앞으로 나가는 시간)
+TIME_SETUP_MOVE = 4.0  # 2.5 -> 4.0초로 연장 (더 넓게 벌림)
+
+# 2. 후진 진입 (오른쪽 뒤로 꺾는 시간)
+TIME_REVERSE_TURN = 5.5  # 3.5 -> 5.5초로 연장 (더 깊게 들어감)
 
 # 거리 기준 (mm)
-CAR_EXIST_DIST = 900  # 옆 차 인식 거리 (좀 더 넉넉하게 900으로 늘림)
+CAR_EXIST_DIST = 900
 EMPTY_SPACE_DIST = 1200
 REAR_LIMIT = 200
 
@@ -92,10 +97,20 @@ def main():
     try:
         ser = serial.Serial(PORT, 9600, timeout=0.1)
         lidar = RPLidar(LIDAR_PORT)
-        print("✅ 시스템 연결 (평행 보정 모드 ON)")
-        time.sleep(2)
+        print("✅ 시스템 연결 성공")
+        time.sleep(1)  # 포트 안정화 대기
     except Exception as e:
         print(f"❌ 오류: {e}"); return
+
+    # ---------------------------------------------------
+    # ★ [추가된 로직] 시작 전 바퀴 정렬 (1.5초간)
+    # ---------------------------------------------------
+    print("🛠️ 초기화: 바퀴 중앙 정렬 중...")
+    ser.write(f"S,{SERVO_CENTER}\n".encode())  # 핸들 중앙
+    ser.write(b"D,0\n")  # 모터 정지
+    time.sleep(1.5)  # 정렬될 때까지 대기
+    print("🚀 정렬 완료! 주행 시작")
+    # ---------------------------------------------------
 
     state = STATE_SEARCH
     search_step = STEP_FIND_CAR1
@@ -108,11 +123,9 @@ def main():
         for scan in lidar.iter_scans():
             read_sensors()
 
-            # --- 평행 보정을 위한 거리 측정 ---
-            # 80도(살짝 앞), 100도(살짝 뒤) 측정
+            # 거리 측정
             lidar_front_side = get_lidar_dist_at_angle(scan, 80, 3)
             lidar_rear_side = get_lidar_dist_at_angle(scan, 100, 3)
-            # 평균 거리 (탐색용)
             lidar_side = (lidar_front_side + lidar_rear_side) / 2
 
             dist_LT = sonar_data[IDX_LT];
@@ -125,42 +138,31 @@ def main():
             sub_msg = ""
 
             # ---------------------------------------------------
-            # [1] 탐색 (★ 평행 보정 적용)
+            # [1] 탐색 (평행 보정)
             # ---------------------------------------------------
             if state == STATE_SEARCH:
                 cmd_speed = SPEED_SEARCH
 
-                # ★ [핵심] 평행 주행 로직 (Wall Following)
-                # 옆에 차가 확실히 있을 때만 보정 (Gap 구간에서는 직진 유지)
+                # 평행 보정 (차가 있을 때만)
                 if lidar_front_side < CAR_EXIST_DIST and lidar_rear_side < CAR_EXIST_DIST:
-                    # 오차 계산 (앞 - 뒤)
-                    # 앞이 가까우면(작으면) error는 음수 -> 핸들 왼쪽(+)으로 꺾어야 함
-                    # 뒤가 가까우면(작으면) error는 양수 -> 핸들 오른쪽(-)으로 꺾어야 함
                     error = lidar_front_side - lidar_rear_side
-
-                    # 서보 값 계산: Center - (Error * Gain)
-                    # 예: error = -100 (앞이 벽쪽) -> correction = +40 -> Center + 40 (Left)
                     correction = int(-error * ALIGN_KP)
-
-                    # 과도한 꺾임 방지 (Limit)
                     correction = max(-MAX_ALIGN_ANGLE, min(MAX_ALIGN_ANGLE, correction))
-
                     cmd_servo = SERVO_CENTER + correction
-                    sub_msg = f"Align: {correction} (F:{int(lidar_front_side)} R:{int(lidar_rear_side)})"
+                    sub_msg = f"Align: {correction}"
                 else:
-                    # 빈 공간이나 차가 없으면 그냥 직진
                     cmd_servo = SERVO_CENTER
-                    sub_msg = "Align: STRAIGHT (No Wall)"
+                    sub_msg = "Align: STRAIGHT"
 
-                # --- 단계별 탐색 로직 ---
+                # 단계별 탐색
                 if search_step == STEP_FIND_CAR1:
-                    msg = "STEP 1: FINDING CAR 1"
+                    msg = "STEP 1: 1번 차 찾는 중..."
                     if lidar_side < CAR_EXIST_DIST:
-                        print("🚗 Car 1 감지! (자세 제어 시작)")
+                        print("🚗 1번 차 발견!")
                         search_step = STEP_PASS_CAR1
 
                 elif search_step == STEP_PASS_CAR1:
-                    msg = "STEP 2: PASSING CAR 1"
+                    msg = "STEP 2: 1번 차 지나는 중..."
                     if lidar_side > EMPTY_SPACE_DIST:
                         valid_gap_count += 1
                         if valid_gap_count >= CNT_GAP_CONFIRM:
@@ -170,47 +172,52 @@ def main():
                         valid_gap_count = 0
 
                 elif search_step == STEP_FIND_GAP:
-                    msg = "STEP 3: FINDING CAR 2"
+                    msg = "STEP 3: 2번 차 찾는 중..."
                     if lidar_side < CAR_EXIST_DIST:
                         valid_car2_count += 1
                         if valid_car2_count >= CNT_CAR2_DETECT:
-                            print(f"🛑 2번 차 감지! 정지 ({valid_car2_count})")
+                            print(f"🛑 2번 차 발견! 정지 ({valid_car2_count})")
                             ser.write(b"D,-150\n");
                             time.sleep(0.1)
                             for _ in range(5): ser.write(b"D,0\n"); time.sleep(0.05)
                             time.sleep(0.5)
+
                             state = STATE_SETUP_LEFT
                             state_timer = time.time()
                     else:
                         valid_car2_count = 0
 
             # ---------------------------------------------------
-            # [2] 공간 확보 (왼쪽 앞으로)
+            # [2] 공간 확보 (왼쪽 앞으로) - 시간 늘림
             # ---------------------------------------------------
             elif state == STATE_SETUP_LEFT:
                 cmd_servo = SERVO_LEFT_MAX
+
+                # Stop & Steer
                 if curr_time - state_timer < STEER_WAIT_TIME:
                     cmd_speed = 0;
-                    msg = "⚡ 핸들 좌측 정렬 중..."
+                    msg = "⚡ 핸들 좌측 정렬..."
                 else:
                     cmd_speed = SPEED_SETUP;
                     msg = "↪ 공간 확보 (전진)"
 
+                # ★ 4.0초 동안 이동
                 if curr_time - state_timer > (STEER_WAIT_TIME + TIME_SETUP_MOVE):
-                    print("🛑 공간 확보 끝.")
+                    print("🛑 공간 확보 끝. 후진 준비")
                     ser.write(b"D,0\n");
                     time.sleep(1.0)
                     state = STATE_REVERSE_TURN
                     state_timer = time.time()
 
             # ---------------------------------------------------
-            # [3] 꺾어서 후진 (우측)
+            # [3] 꺾어서 후진 (우측) - 시간 늘림
             # ---------------------------------------------------
             elif state == STATE_REVERSE_TURN:
                 cmd_servo = SERVO_RIGHT_MAX
+
                 if curr_time - state_timer < STEER_WAIT_TIME:
                     cmd_speed = 0;
-                    msg = "⚡ 핸들 우측 정렬 중..."
+                    msg = "⚡ 핸들 우측 정렬..."
                 else:
                     cmd_speed = -SPEED_PARK;
                     msg = "PARKING: 꺾어서 진입"
@@ -218,7 +225,8 @@ def main():
                 if dist_LT < REAR_LIMIT or dist_RT < REAR_LIMIT:
                     state = STATE_DONE
 
-                if curr_time - state_timer > (STEER_WAIT_TIME + 3.5):
+                # ★ 5.5초 동안 후진
+                if curr_time - state_timer > (STEER_WAIT_TIME + TIME_REVERSE_TURN):
                     state = STATE_REVERSE_STRAIGHT
                     state_timer = time.time()
 
@@ -227,19 +235,20 @@ def main():
             # ---------------------------------------------------
             elif state == STATE_REVERSE_STRAIGHT:
                 cmd_servo = SERVO_CENTER
+
                 if curr_time - state_timer < STEER_WAIT_TIME:
                     cmd_speed = 0;
-                    msg = "⚡ 핸들 중앙 정렬 중..."
+                    msg = "⚡ 핸들 중앙 정렬..."
                 else:
                     cmd_speed = -SPEED_PARK;
                     msg = "PARKING: 직진 후진"
 
                 if dist_LT < REAR_LIMIT or dist_RT < REAR_LIMIT:
-                    print("✅ 후방 감지 -> 주차 완료")
+                    print("✅ 후방 감지 -> 완료")
                     state = STATE_DONE
 
                 if curr_time - state_timer > (STEER_WAIT_TIME + 2.5):
-                    print("✅ 시간 종료 -> 주차 완료")
+                    print("✅ 시간 종료 -> 완료")
                     state = STATE_DONE
 
             # ---------------------------------------------------
@@ -255,9 +264,9 @@ def main():
             ser.write(f"D,{cmd_speed}\n".encode())
 
             debug_img = np.zeros((300, 600, 3), dtype=np.uint8)
-            cv2.putText(debug_img, f"State: {state} | {msg}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255),
-                        2)
-            cv2.putText(debug_img, sub_msg, (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+            cv2.putText(debug_img, f"State: {state}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(debug_img, msg, (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(debug_img, sub_msg, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
 
             cv2.imshow("Parking Monitor", debug_img)
             if cv2.waitKey(1) == ord('q'): break
