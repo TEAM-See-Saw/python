@@ -20,7 +20,10 @@ SERVO_RIGHT_MAX = 440
 SERVO_LEFT_MAX = 680
 STEER_WAIT_TIME = 0.8
 
-TARGET_SETUP_X = -1200
+# ★ [시간 설정] 하드코딩용 시간 (초)
+TIME_SETUP_MOVE = 5.0  # 왼쪽 앞으로 5초
+TIME_REVERSE_TURN = 5.0  # 오른쪽 뒤로 5초 (★ 추가됨)
+
 TARGET_PARK_X = -400
 CAR_EXIST_DIST = 950
 EMPTY_SPACE_DIST = 1000
@@ -29,13 +32,12 @@ REAR_LIMIT = 200
 IDX_LT = 2;
 IDX_RT = 5
 
-# ★ 상태 정의 (PAUSE 추가됨)
 STATE_SEARCH = 0
 STATE_SETUP_LEFT = 1
 STATE_REVERSE_TURN = 2
 STATE_REVERSE_STRAIGHT = 3
 STATE_DONE = 4
-STATE_PAUSE = 99  # ★ [핵심] 멈춰서 기다리는 상태
+STATE_PAUSE = 99
 
 STEP_FIND_CAR1 = 0;
 STEP_PASS_CAR1 = 1
@@ -94,7 +96,8 @@ def main():
         time.sleep(1)
         lidar.clean_input()
     except Exception as e:
-        print(f"❌ 오류: {e}"); return
+        print(f"❌ 오류: {e}");
+        return
 
     # 초기 바퀴 정렬
     ser.write(f"S,{SERVO_CENTER}\n".encode());
@@ -110,7 +113,6 @@ def main():
     valid_car2_count = 0
     last_corner_x = 0
 
-    # ★ PAUSE 상태를 위한 변수들
     pause_start_time = 0
     pause_duration = 0
     next_state_after_pause = 0
@@ -121,7 +123,6 @@ def main():
             for scan in lidar.iter_scans():
                 read_sensors()
 
-                # 센서 데이터 갱신
                 lidar_radar = get_lidar_min_dist(scan, 30, 110)
                 curr_corner_x = get_car2_corner_x(scan)
                 if curr_corner_x is not None: last_corner_x = curr_corner_x
@@ -134,23 +135,17 @@ def main():
                 msg = "";
                 sub_msg = ""
 
-                # =========================================================
-                # ★ [NEW] 멈춤(PAUSE) 상태 로직 (루프를 끊지 않고 대기)
-                # =========================================================
+                # [PAUSE 상태]
                 if state == STATE_PAUSE:
-                    cmd_speed = 0  # 멈춤 유지
+                    cmd_speed = 0
                     msg = f"WAITING... ({pause_msg})"
-
-                    # 시간이 다 됐는지 체크
                     if curr_time - pause_start_time > pause_duration:
-                        print(f"⏰ 대기 종료 -> {next_state_after_pause} 상태로 이동")
+                        print(f"⏰ 대기 종료 -> {next_state_after_pause}")
                         state = next_state_after_pause
-                        state_timer = curr_time  # 다음 상태를 위해 타이머 리셋
-                        lidar.clean_input()  # 이동 전 버퍼 비우기
+                        state_timer = curr_time
+                        lidar.clean_input()
 
-                # ---------------------------------------------------
                 # [1] 탐색
-                # ---------------------------------------------------
                 elif state == STATE_SEARCH:
                     cmd_speed = SPEED_SEARCH
 
@@ -174,36 +169,34 @@ def main():
                         msg = "FIND CAR 2"
                         if lidar_radar < CAR_EXIST_DIST:
                             print(f"🛑 2번 차 감지! 정지 (거리: {int(lidar_radar)}mm)")
-
-                            # 1. 일단 급정거 명령 보냄 (짧은 딜레이는 괜찮음)
                             ser.write(b"D,-150\n");
                             time.sleep(0.1)
                             ser.write(b"D,0\n")
 
-                            # 2. time.sleep(0.8) 대신 PAUSE 상태로 전환!
                             state = STATE_PAUSE
                             next_state_after_pause = STATE_SETUP_LEFT
-                            pause_duration = 1.0  # 1초 대기
+                            pause_duration = 1.0
                             pause_start_time = curr_time
                             pause_msg = "Ready for Setup"
 
                 # ---------------------------------------------------
-                # [2] 공간 확보
+                # [2] 공간 확보 (5초 하드코딩)
                 # ---------------------------------------------------
                 elif state == STATE_SETUP_LEFT:
                     cmd_servo = SERVO_LEFT_MAX
+
                     if curr_time - state_timer < STEER_WAIT_TIME:
-                        cmd_speed = 0;
+                        cmd_speed = 0
                         msg = "Align Left..."
                     else:
                         cmd_speed = SPEED_SETUP
-                        msg = f"SETUP: X={int(last_corner_x)}"
+                        driving_time = (curr_time - state_timer) - STEER_WAIT_TIME
+                        msg = f"SETUP: {driving_time:.1f}s / {TIME_SETUP_MOVE}s"
 
-                        if last_corner_x < TARGET_SETUP_X:
-                            print("🛑 공간 확보 완료. 정지.")
+                        if driving_time > TIME_SETUP_MOVE:
+                            print("🛑 공간 확보 완료 (5초). 정지.")
                             ser.write(b"D,0\n")
 
-                            # 여기서도 sleep 대신 PAUSE
                             state = STATE_PAUSE
                             next_state_after_pause = STATE_REVERSE_TURN
                             pause_duration = 1.0
@@ -211,35 +204,51 @@ def main():
                             pause_msg = "Ready for Reverse"
 
                 # ---------------------------------------------------
-                # [3] 꺾어서 후진
+                # [3] 꺾어서 후진 (★ 여기도 5초 하드코딩 적용됨)
                 # ---------------------------------------------------
                 elif state == STATE_REVERSE_TURN:
                     cmd_servo = SERVO_RIGHT_MAX
+
+                    # 1. 핸들 정렬 대기
                     if curr_time - state_timer < STEER_WAIT_TIME:
-                        cmd_speed = 0;
+                        cmd_speed = 0
                         msg = "Align Right..."
                     else:
+                        # 2. 후진
                         cmd_speed = -SPEED_PARK
-                        msg = f"TURN: X={int(last_corner_x)}"
+                        driving_time = (curr_time - state_timer) - STEER_WAIT_TIME
+                        msg = f"TURN: {driving_time:.1f}s / {TIME_REVERSE_TURN}s"
 
-                        if last_corner_x > TARGET_PARK_X or dist_LT < REAR_LIMIT or dist_RT < REAR_LIMIT:
-                            print("🛑 1차 후진 완료")
+                        # ★ [수정] 센서 무시하고 시간으로만 체크
+                        if driving_time > TIME_REVERSE_TURN:
+                            print("🛑 1차 후진 완료 (5초). 정지.")
 
-                            # 바로 다음 단계로 (여긴 대기 없이 가도 됨)
+                            # 바로 직선 후진 단계로 이동
                             state = STATE_REVERSE_STRAIGHT
                             state_timer = curr_time
+                            # (원한다면 여기서도 PAUSE를 넣을 수 있음)
 
                 # ---------------------------------------------------
-                # [4] 마무리
+                # [4] 마무리 (직진 후진 - 여기는 센서로 멈추는 게 좋음)
                 # ---------------------------------------------------
                 elif state == STATE_REVERSE_STRAIGHT:
                     cmd_servo = SERVO_CENTER
+
                     if curr_time - state_timer < STEER_WAIT_TIME:
                         cmd_speed = 0
+                        msg = "Align Center..."
                     else:
                         cmd_speed = -SPEED_PARK
+                        msg = f"STRAIGHT: LT={dist_LT} RT={dist_RT}"
 
+                    # 여기는 벽을 박으면 안 되니까 센서 유지
                     if dist_LT < REAR_LIMIT or dist_RT < REAR_LIMIT:
+                        print("✅ 주차 완료 (벽 감지)")
+                        state = STATE_DONE
+
+                    # 혹시 센서 고장 대비 시간 제한 (3초)
+                    if (curr_time - state_timer) > (STEER_WAIT_TIME + 3.0):
+                        print("✅ 주차 완료 (시간 종료)")
                         state = STATE_DONE
 
                 elif state == STATE_DONE:
@@ -247,26 +256,19 @@ def main():
                     msg = "DONE"
                     ser.write(b"D,0\n")
 
-                # 명령 전송
                 ser.write(f"S,{cmd_servo}\n".encode())
                 ser.write(f"D,{cmd_speed}\n".encode())
 
-                # 화면 표시
                 debug_img = np.zeros((300, 600, 3), dtype=np.uint8)
-                cv2.putText(debug_img, f"State: {state} | X: {int(last_corner_x)}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.7, (255, 255, 255), 2)
-                cv2.putText(debug_img, f"Radar: {int(lidar_radar)}", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                            (0, 255, 255), 1)
+                cv2.putText(debug_img, f"State: {state}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                 cv2.putText(debug_img, msg, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 cv2.imshow("Parking Monitor", debug_img)
                 if cv2.waitKey(1) == ord('q'): break
 
         except RPLidarException as e:
-            # 혹시라도 버퍼 에러가 나면 여기서 잡고 다시 돌림
-            print(f"⚠️ 라이다 통신 오류(복구 중): {e}")
+            print(f"⚠️ 라이다 오류: {e}")
             lidar.clean_input()
             continue
-
         except KeyboardInterrupt:
             print("종료")
             break
