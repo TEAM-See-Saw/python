@@ -20,13 +20,16 @@ SERVO_RIGHT_MAX = 440
 SERVO_LEFT_MAX = 680
 STEER_WAIT_TIME = 0.8
 
-# ★ [시간 설정] 하드코딩용 시간 (초)
-TIME_SETUP_MOVE = 5.0  # 왼쪽 앞으로 5초
-TIME_REVERSE_TURN = 5.0  # 오른쪽 뒤로 5초 (★ 추가됨)
+# [시간 설정] 하드코딩 유지
+TIME_SETUP_MOVE = 4.0  # 5초
+TIME_REVERSE_TURN = 4.0  # 5초
 
 TARGET_PARK_X = -400
 CAR_EXIST_DIST = 950
 EMPTY_SPACE_DIST = 1000
+
+# ★ [신규 설정] 측면 감지 정지 기준
+SIDE_STOP_DIST = 700  # 1.2m 이내에 80도/280도 물체 감지 시 정지
 
 REAR_LIMIT = 200
 IDX_LT = 2;
@@ -68,6 +71,18 @@ def get_lidar_min_dist(scan, start_angle, end_angle):
         if dist > 0 and (start_angle <= angle <= end_angle):
             dists.append(dist)
     if len(dists) > 0: return np.min(dists)
+    return 9999
+
+
+# ★ [신규 함수] 특정 각도 근처의 거리값 가져오기
+def get_dist_at_angle(scan, target_angle, range_pm=2):
+    dists = []
+    min_a = target_angle - range_pm
+    max_a = target_angle + range_pm
+    for (_, angle, dist) in scan:
+        if dist > 0 and (min_a <= angle <= max_a):
+            dists.append(dist)
+    if len(dists) > 0: return np.mean(dists)
     return 9999
 
 
@@ -123,7 +138,13 @@ def main():
             for scan in lidar.iter_scans():
                 read_sensors()
 
+                # 센서 값 갱신
                 lidar_radar = get_lidar_min_dist(scan, 30, 110)
+
+                # ★ 80도, 280도 거리 측정
+                dist_80 = get_dist_at_angle(scan, 80, 2)
+                dist_280 = get_dist_at_angle(scan, 280, 2)
+
                 curr_corner_x = get_car2_corner_x(scan)
                 if curr_corner_x is not None: last_corner_x = curr_corner_x
                 dist_LT = sonar_data[IDX_LT];
@@ -184,9 +205,8 @@ def main():
                 # ---------------------------------------------------
                 elif state == STATE_SETUP_LEFT:
                     cmd_servo = SERVO_LEFT_MAX
-
                     if curr_time - state_timer < STEER_WAIT_TIME:
-                        cmd_speed = 0
+                        cmd_speed = 0;
                         msg = "Align Left..."
                     else:
                         cmd_speed = SPEED_SETUP
@@ -204,50 +224,48 @@ def main():
                             pause_msg = "Ready for Reverse"
 
                 # ---------------------------------------------------
-                # [3] 꺾어서 후진 (★ 여기도 5초 하드코딩 적용됨)
+                # [3] 꺾어서 후진 (5초 하드코딩)
                 # ---------------------------------------------------
                 elif state == STATE_REVERSE_TURN:
                     cmd_servo = SERVO_RIGHT_MAX
-
-                    # 1. 핸들 정렬 대기
                     if curr_time - state_timer < STEER_WAIT_TIME:
-                        cmd_speed = 0
+                        cmd_speed = 0;
                         msg = "Align Right..."
                     else:
-                        # 2. 후진
                         cmd_speed = -SPEED_PARK
                         driving_time = (curr_time - state_timer) - STEER_WAIT_TIME
                         msg = f"TURN: {driving_time:.1f}s / {TIME_REVERSE_TURN}s"
 
-                        # ★ [수정] 센서 무시하고 시간으로만 체크
                         if driving_time > TIME_REVERSE_TURN:
                             print("🛑 1차 후진 완료 (5초). 정지.")
-
-                            # 바로 직선 후진 단계로 이동
                             state = STATE_REVERSE_STRAIGHT
                             state_timer = curr_time
-                            # (원한다면 여기서도 PAUSE를 넣을 수 있음)
 
                 # ---------------------------------------------------
-                # [4] 마무리 (직진 후진 - 여기는 센서로 멈추는 게 좋음)
+                # [4] 마무리 (★ 80도 or 280도 인식 시 정지)
                 # ---------------------------------------------------
                 elif state == STATE_REVERSE_STRAIGHT:
                     cmd_servo = SERVO_CENTER
 
                     if curr_time - state_timer < STEER_WAIT_TIME:
-                        cmd_speed = 0
+                        cmd_speed = 0;
                         msg = "Align Center..."
                     else:
                         cmd_speed = -SPEED_PARK
-                        msg = f"STRAIGHT: LT={dist_LT} RT={dist_RT}"
+                        msg = f"FINISH: 80deg={int(dist_80)} 280deg={int(dist_280)}"
 
-                    # 여기는 벽을 박으면 안 되니까 센서 유지
+                    # 1. 후방 센서 체크 (안전장치)
                     if dist_LT < REAR_LIMIT or dist_RT < REAR_LIMIT:
-                        print("✅ 주차 완료 (벽 감지)")
+                        print("✅ 주차 완료 (후방 벽 감지)")
                         state = STATE_DONE
 
-                    # 혹시 센서 고장 대비 시간 제한 (3초)
-                    if (curr_time - state_timer) > (STEER_WAIT_TIME + 3.0):
+                    # 2. ★ [핵심] 80도(우) or 280도(좌) 물체 감지 시 정지
+                    elif dist_80 < SIDE_STOP_DIST or dist_280 < SIDE_STOP_DIST:
+                        print(f"✅ 주차 완료 (측면 인식: 80도={int(dist_80)}, 280도={int(dist_280)})")
+                        state = STATE_DONE
+
+                    # 3. 시간 제한 (3초)
+                    elif (curr_time - state_timer) > (STEER_WAIT_TIME + 3.0):
                         print("✅ 주차 완료 (시간 종료)")
                         state = STATE_DONE
 
@@ -261,6 +279,8 @@ def main():
 
                 debug_img = np.zeros((300, 600, 3), dtype=np.uint8)
                 cv2.putText(debug_img, f"State: {state}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                cv2.putText(debug_img, f"80deg: {int(dist_80)} | 280deg: {int(dist_280)}", (10, 100),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
                 cv2.putText(debug_img, msg, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 cv2.imshow("Parking Monitor", debug_img)
                 if cv2.waitKey(1) == ord('q'): break
