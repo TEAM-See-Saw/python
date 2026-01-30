@@ -1,259 +1,336 @@
-'''
-1. BEV 변환: 도로를 위에서 본 평면도로 만듭니다(11자 차선이 됨)
-2. 화이트 필터: 흰색 차선만 강력하게 뽑아냅니다
-3. 히스토그램 분석: 차선이 어디에 뭉쳐있는지 찾아냅니다(끊긴 차선에 강함)
-4. PID 제어: 사람이 운전하듯 부드럽게 곡선을 타도록 제어합니다
-
-<튜닝>
-1. BEV 영역 맞추기 (노란색 네모): 64~69줄 src_points 숫자
-2. 흰색 잘 따지는지 확인
-   오른쪽 화면(검은 배경)에 흰색 차선이 선명하게 나오는지 확인
-   -만약 바닥 전체가 희게 나오면 코드 91줄 lower_white의 180->200
-   -차선이 잘 안 보이면 180을 150으로 
-3. 주행감 조절 (PID)
-   -지그재그가 심하다? Kd = 0.15를 0.2나 0.3으로 올리기(브레이크를 더 강하게 검)
-   -코너를 너무 작게 돈다(반응이 느리다)? Kp = 0.4를 0.5나 0.6으로 올리세요.
-'''
-
 import cv2
 import numpy as np
+import math
 import serial
 import time
+import datetime
+import os
+import threading
 
 # ==========================================
-# [1] 설정 (내 차에 맞게 튜닝 필수)
+# [1] 환경 설정 (사용자 환경에 맞게 수정)
 # ==========================================
-CAM_INDEX = 0
-PORT = 'COM4'
-BAUDRATE = 9600
+IS_SUNNY = True  # True: 햇빛 쨍쨍 / False: 실내, 흐림
 
-# 서보 & 속도
-SERVO_CENTER = 570
-SERVO_LEFT_MAX = 680   # 좌회전 최대값
-SERVO_RIGHT_MAX = 480  # 우회전 최대값
-MAX_SPEED = 200        # 테스트 속도
+# ⚙️ 포트 설정 (장치 관리자 확인 필수!)
+PORT_ARDUINO = 'COM4'   # 아두이노
+PORT_LIDAR   = 'COM5'   # 라이다 (없으면 None으로 두면 무시됨)
+BAUDRATE     = 9600
+CAM_INDEX    = 0
 
-# 해상도 (BEV 변환을 위해 640x480 권장)
-WIDTH = 640
-HEIGHT = 480
+# ⚙️ 주행 값 설정
+MAX_SPEED      = 120   # 평소 주행 속도 (안전을 위해 조금 줄임)
+SERVO_CENTER   = 570
+SERVO_LEFT_MAX = 680
+SERVO_RIGHT_MAX= 480
 
-# ★ PID 제어 상수 (사람 같은 주행의 핵심) ★
-# 차가 비틀거리면 Kp를 줄이고(0.3), 코너를 못 돌면 Kp를 늘리세요(0.5)
-Kp = 0.4  # 비례항: 오차만큼 꺾기
-Kd = 0.15 # 미분항: 급발진/진동 억제 (핸들 떨림 방지)
-Ki = 0.0  # 적분항: 보통 0으로 둠
+# ⚙️ 미션 임계값
+LIDAR_STOP_DIST = 600  # 600mm(60cm) 이내 장애물 감지 시 정지
+TRAFFIC_ROI_H   = 0.4  # 화면 상단 40%만 신호등으로 인식
 
 # ==========================================
-# [2] 시리얼 연결
+# [2] 라이브러리 로드 (RPLidar)
 # ==========================================
-ser = None
 try:
-    ser = serial.Serial(PORT, BAUDRATE, timeout=1)
-    time.sleep(2)
-    print(f"✅ 아두이노 연결 성공: {PORT}")
-except Exception as e:
-    print(f"⚠️ 연결 실패 (시뮬레이션 모드): {e}")
+    from rplidar import RPLidar
+    HAS_LIDAR = True
+except ImportError:
+    print("⚠️ 'rplidar' 라이브러리가 없습니다. (pip install rplidar-types)")
+    HAS_LIDAR = False
 
 # ==========================================
-# [3] 카메라 설정 (MJPG 고속 모드)
+# [3] 모드별 자동 튜닝값
 # ==========================================
-params = [
-    cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'),
-    cv2.CAP_PROP_FRAME_WIDTH, 1920,
-    cv2.CAP_PROP_FRAME_HEIGHT, 1080,
-    cv2.CAP_PROP_FPS, 30
-]
-cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW, params)
-if not cap.isOpened():
-    print("❌ 카메라 오류")
-    exit()
+if IS_SUNNY:
+    print(f"☀️ [모드: SUNNY] 강력한 햇빛 대응 설정")
+    EXPOSURE = -9
+    L_MIN = 160
+    S_MAX = 50
+    MORPH_SIZE = (5, 5)
+else:
+    print(f"🌙 [모드: NORMAL] 실내/저녁 설정")
+    EXPOSURE = -4
+    L_MIN = 100
+    S_MAX = 60
+    MORPH_SIZE = (3, 3)
 
 # ==========================================
-# [4] 핵심 알고리즘 함수들
+# [4] 공유 변수 및 스레드 (라이다, 신호등)
 # ==========================================
+shared_data = {
+    "front_dist": 9999,  # 전방 장애물 거리 (mm)
+    "traffic": "NONE",   # 신호등 상태: NONE, RED, GREEN
+    "running": True      # 프로그램 종료 플래그
+}
 
-def warp_perspective(img):
-    """
-    [핵심 1] Bird's Eye View (탑뷰) 변환
-    사다리꼴 이미지를 직사각형으로 펴서 차선을 평행하게 만듦
-    """
-    h, w = img.shape[:2]
+def thread_lidar():
+    """ 라이다 센서 값을 백그라운드에서 계속 읽어옴 """
+    if not HAS_LIDAR: return
     
-    # [중요] 소스 좌표 (사다리꼴): 화면에서 '도로 바닥' 영역 지정
-    # 이 좌표가 안 맞으면 탑뷰가 찌그러집니다. 화면 보면서 조절 필요.
-    src_points = np.float32([
-        [w * 0.15, h * 0.85],  # 좌하 (화면 아래쪽 넓게)
-        [w * 0.85, h * 0.85],  # 우하
-        [w * 0.35, h * 0.45],  # 좌상 (화면 위쪽 좁게 - 멀리 있는 도로)
-        [w * 0.65, h * 0.45]   # 우상
-    ])
+    lidar = RPLidar(PORT_LIDAR)
+    print(f"📡 라이다 연결 성공: {PORT_LIDAR}")
     
-    # 목적지 좌표 (직사각형): 이미지를 꽉 채우도록 폄
-    dst_points = np.float32([
-        [w * 0.2, h],       # 좌하
-        [w * 0.8, h],       # 우하
-        [w * 0.2, 0],       # 좌상
-        [w * 0.8, 0]        # 우상
-    ])
-    
-    M = cv2.getPerspectiveTransform(src_points, dst_points)
-    Minv = cv2.getPerspectiveTransform(dst_points, src_points) # 복구용
-    warped = cv2.warpPerspective(img, M, (w, h), flags=cv2.INTER_LINEAR)
-    
-    return warped, src_points
+    try:
+        for scan in lidar.iter_scans():
+            if not shared_data["running"]: break
+            
+            min_dist = 9999
+            for (_, angle, dist) in scan:
+                # 전방 30도 부채꼴 (0~15도, 345~360도)
+                if (angle < 15 or angle > 345) and dist > 0:
+                    if dist < min_dist:
+                        min_dist = dist
+            
+            shared_data["front_dist"] = min_dist
+    except Exception as e:
+        print(f"❌ 라이다 오류: {e}")
+    finally:
+        lidar.stop()
+        lidar.disconnect()
 
-def color_filter_white(img):
-    """
-    [핵심 2] 흰색 차선 추출 (HSV 색상 공간)
-    자연광 아래서는 RGB보다 HSV가 더 유리함
-    """
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+def detect_traffic_light(frame):
+    """ 화면 상단에서 신호등 색상 인식 """
+    h, w = frame.shape[:2]
+    # 화면 상단 40%만 잘라서 확인 (신호등은 위에 있으므로)
+    roi = frame[0:int(h * TRAFFIC_ROI_H), :]
     
-    # 흰색 정의: 채도(S)는 낮고, 명도(V)는 높은 색
-    # 햇빛이 강하면 180을 200으로 올리세요. 그늘지면 150으로 내리세요.
-    lower_white = np.array([0, 0, 180])  
-    upper_white = np.array([179, 40, 255]) 
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     
-    mask = cv2.inRange(hsv, lower_white, upper_white)
-    return mask
-
-def get_lane_center_histogram(binary_warped):
-    """
-    [핵심 3] 히스토그램 분석
-    화면 하단의 흰색 픽셀 분포를 분석해 차선 위치 결정
-    """
-    h, w = binary_warped.shape
+    # 빨간색 범위 (두 개로 나뉨)
+    lower_red1 = np.array([0, 100, 100])
+    upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([170, 100, 100])
+    upper_red2 = np.array([180, 255, 255])
     
-    # 화면 하단 50%만 분석 (가장 가까운 도로)
-    bottom_half = binary_warped[h//2:, :]
+    # 초록색 범위
+    lower_green = np.array([40, 100, 100])
+    upper_green = np.array([90, 255, 255])
     
-    # 세로로 픽셀을 다 더함 -> 막대그래프처럼 됨
-    histogram = np.sum(bottom_half, axis=0)
+    mask_r1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask_r2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    mask_red = cv2.bitwise_or(mask_r1, mask_r2)
+    mask_green = cv2.inRange(hsv, lower_green, upper_green)
     
-    midpoint = int(histogram.shape[0] / 2)
+    # 픽셀 수 카운트 (노이즈 제거를 위해 일정 개수 이상이어야 인식)
+    red_pixels = cv2.countNonZero(mask_red)
+    green_pixels = cv2.countNonZero(mask_green)
     
-    # 왼쪽 절반에서 가장 높은 봉우리 / 오른쪽 절반에서 가장 높은 봉우리 찾기
-    leftx_base = np.argmax(histogram[:midpoint])
-    rightx_base = np.argmax(histogram[midpoint:]) + midpoint
+    threshold = 200 # 인식 최소 픽셀 수
     
-    # 예외 처리: 차선이 거의 안 보이면(픽셀 합이 너무 작으면) 감지 실패로 간주
-    if np.max(histogram[:midpoint]) < 100: leftx_base = None
-    if np.max(histogram[midpoint:]) < 100: rightx_base = None
-
-    image_center = w // 2
-    lane_center = image_center # 기본값: 직진
-    
-    # 양쪽 차선 다 보임 -> 그 정중앙이 목표
-    if leftx_base is not None and rightx_base is not None:
-        lane_center = (leftx_base + rightx_base) // 2
+    status = "NONE"
+    if red_pixels > threshold and red_pixels > green_pixels:
+        status = "RED"
+    elif green_pixels > threshold and green_pixels > red_pixels:
+        status = "GREEN"
         
-    # 왼쪽만 보임 -> 왼쪽 차선에서 일정 거리 떨어진 곳이 목표
-    elif leftx_base is not None:
-        lane_center = leftx_base + 260 # 260은 차선 폭의 절반 정도 (튜닝 필요)
-        
-    # 오른쪽만 보임 -> 오른쪽 차선에서 일정 거리 떨어진 곳이 목표
-    elif rightx_base is not None:
-        lane_center = rightx_base - 260
-        
-    return lane_center, leftx_base, rightx_base
-
-# PID 제어 변수 (전역)
-prev_error = 0
-integral = 0
-
-def pid_control(error):
-    """
-    [핵심 4] PID 제어기
-    단순 비례 제어가 아니라, 급격한 변화를 막아주는(D) 기능 포함
-    """
-    global prev_error, integral
-    
-    # P: 오차만큼 꺾어라
-    p_term = Kp * error
-    
-    # D: 오차의 변화 속도를 줄여라 (진동 방지)
-    d_term = Kd * (error - prev_error)
-    
-    # I: 누적 오차 (여기선 잘 안 씀)
-    # integral += error
-    # i_term = Ki * integral
-    
-    prev_error = error
-    
-    return p_term + d_term # + i_term
+    return status, roi
 
 # ==========================================
-# [5] 메인 루프
+# [5] 기존 영상 처리 함수 (라인트레이싱)
+# ==========================================
+def region_of_interest(img, vertices):
+    mask = np.zeros_like(img)
+    cv2.fillPoly(mask, vertices, 255)
+    return cv2.bitwise_and(img, mask)
+
+def make_points(image, line_parameters):
+    try:
+        slope, intercept = line_parameters
+    except TypeError:
+        return None
+    y1 = image.shape[0]
+    y2 = int(y1 * 0.6)
+    if slope == 0: slope = 0.001
+    x1 = int((y1 - intercept) / slope)
+    x2 = int((y2 - intercept) / slope)
+    return [[x1, y1, x2, y2]]
+
+def average_slope_intercept(image, lines):
+    left_fit = []
+    right_fit = []
+    if lines is None: return None, None
+    for line in lines:
+        for x1, y1, x2, y2 in line:
+            fit = np.polyfit((x1, x2), (y1, y2), 1)
+            slope = fit[0]
+            intercept = fit[1]
+            if slope < -0.5:
+                left_fit.append((slope, intercept))
+            elif slope > 0.5:
+                right_fit.append((slope, intercept))
+    left_line = make_points(image, np.mean(left_fit, axis=0)) if len(left_fit) > 0 else None
+    right_line = make_points(image, np.mean(right_fit, axis=0)) if len(right_fit) > 0 else None
+    return left_line, right_line
+
+def calculate_steering_angle(image, left_line, right_line):
+    height, width, _ = image.shape
+    car_position_x = width / 2
+
+    if left_line is not None and right_line is not None:
+        target_x = (left_line[0][2] + right_line[0][2]) / 2
+    elif left_line is not None:
+        target_x = left_line[0][2] + (width * 0.25)
+    elif right_line is not None:
+        target_x = right_line[0][2] - (width * 0.25)
+    else:
+        target_x = car_position_x
+
+    dx = target_x - car_position_x
+    dy = (height * 0.6) - height
+    angle_deg = math.degrees(math.atan2(dx, abs(dy)))
+    return angle_deg, int(target_x)
+
+def map_value(x, in_min, in_max, out_min, out_max):
+    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+
+# ==========================================
+# [6] 메인 실행 함수
 # ==========================================
 def main():
-    print("🚀 BEV + PID 주행 시작")
+    # 1. 아두이노 연결
+    ser = None
+    try:
+        ser = serial.Serial(PORT_ARDUINO, BAUDRATE, timeout=1)
+        print(f"✅ 아두이노 연결 성공 ({PORT_ARDUINO})")
+        time.sleep(2)
+    except Exception as e:
+        print(f"❌ 아두이노 연결 실패: {e}")
+
+    # 2. 카메라 설정
+    cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
+    width, height = 640, 480
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_EXPOSURE, EXPOSURE) # 밝기 설정
+
+    if not cap.isOpened():
+        print("❌ 카메라 실패")
+        return
+
+    # 3. 녹화 설정
+    if not os.path.exists('dataset'): os.makedirs('dataset')
+    now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = cv2.VideoWriter(f"dataset/mission_{now}.mp4", 
+                          cv2.VideoWriter_fourcc(*'mp4v'), 20.0, (width*2, height))
+
+    # 4. 라이다 스레드 시작
+    if HAS_LIDAR:
+        t_lidar = threading.Thread(target=thread_lidar)
+        t_lidar.start()
+
+    print(f"🚀 미션 주행 시작! 속도: {MAX_SPEED}")
     if ser: ser.write(f"D,{MAX_SPEED}\n".encode())
-    
-    prev_time = time.time()
 
-    while True:
-        ret, frame = cap.read()
-        if not ret: break
-
-        # 1. 리사이즈 (속도 최적화)
-        frame = cv2.resize(frame, (WIDTH, HEIGHT))
-        
-        # 2. BEV 변환 (탑뷰 만들기)
-        warped, src_points = warp_perspective(frame)
-        
-        # 3. 흰색 차선 추출
-        binary = color_filter_white(warped)
-        
-        # 4. 차선 중심 찾기
-        target_center, lx, rx = get_lane_center_histogram(binary)
-        
-        # 5. 오차 계산 (화면중앙 - 차선중앙)
-        # 값이 양수면 차선이 오른쪽에 있음 -> 오른쪽으로 핸들 돌려야 함
-        image_center = WIDTH // 2
-        error = target_center - image_center
-        
-        # 6. PID 계산
-        control_val = pid_control(error)
-        
-        # 7. 서보 값 매핑
-        # control_val을 서보 각도로 변환
-        steering = SERVO_CENTER + int(control_val)
-        
-        # 안전장치 (최대/최소값 제한)
-        steering = max(SERVO_RIGHT_MAX, min(SERVO_LEFT_MAX, steering))
-        
-        if ser: ser.write(f"S,{steering}\n".encode())
-
-        # --- 디버깅 화면 (튜닝용) ---
-        cur_time = time.time()
-        dt = cur_time - prev_time
-        if dt == 0: dt = 0.001
-        fps = 1.0 / dt
-        prev_time = cur_time
-        
-        # [왼쪽 화면] 원본에 BEV 영역 표시
-        debug_ori = frame.copy()
-        cv2.polylines(debug_ori, [np.int32(src_points)], True, (0, 255, 255), 2)
-        cv2.putText(debug_ori, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        
-        # [오른쪽 화면] BEV 결과 + 차선 인식 상태
-        debug_bev = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-        if lx: cv2.line(debug_bev, (lx, 0), (lx, HEIGHT), (255, 0, 0), 3) # 왼쪽 파랑
-        if rx: cv2.line(debug_bev, (rx, 0), (rx, HEIGHT), (0, 0, 255), 3) # 오른쪽 빨강
-        cv2.line(debug_bev, (target_center, 0), (target_center, HEIGHT), (0, 255, 0), 2) # 목표 초록
-        cv2.line(debug_bev, (image_center, 0), (image_center, HEIGHT), (255, 255, 255), 1) # 내 차 중심
-        
-        cv2.imshow('Left: Raw(Area) / Right: BEV', cv2.hconcat([debug_ori, debug_bev]))
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+    # ==========================
+    # 메인 루프
+    # ==========================
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
             
-    if ser:
-        ser.write(b"D,0\n")
-        ser.write(f"S,{SERVO_CENTER}\n".encode())
-        ser.close()
-    cap.release()
-    cv2.destroyAllWindows()
+            # 리사이즈 안전장치
+            if frame.shape[1] != width: frame = cv2.resize(frame, (width, height))
+
+            # ---------------------------
+            # [A] 센서 판단 (신호등 & 장애물)
+            # ---------------------------
+            
+            # 1. 신호등 인식
+            traffic_status, roi_frame = detect_traffic_light(frame)
+            shared_data["traffic"] = traffic_status
+            
+            # 2. 장애물 거리 읽기
+            lidar_d = shared_data["front_dist"]
+            
+            # 3. 주행 상태 결정
+            # 우선순위: 빨간불(정지) > 장애물(정지) > 녹색불/없음(주행)
+            
+            current_speed = MAX_SPEED
+            status_msg = "DRIVE"
+            
+            if traffic_status == "RED":
+                current_speed = 0
+                status_msg = "🔴 RED LIGHT"
+                
+            elif lidar_d < LIDAR_STOP_DIST:
+                current_speed = 0
+                status_msg = f"⚠️ OBSTACLE ({int(lidar_d)}mm)"
+                
+            else:
+                # 정상 주행
+                status_msg = "🟢 GO"
+            
+            # ---------------------------
+            # [B] 라인트레이싱 (영상처리)
+            # ---------------------------
+            # 기존 코드 로직 그대로 사용
+            hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
+            lower_white = np.array([0, L_MIN, 0])
+            upper_white = np.array([179, 255, S_MAX])
+            mask = cv2.inRange(hls, lower_white, upper_white)
+            
+            kernel = np.ones(MORPH_SIZE, np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            edges = cv2.Canny(mask, 50, 150)
+            
+            roi_v = [(0, height), (width//2 - 50, int(height*0.6)), 
+                     (width//2 + 50, int(height*0.6)), (width, height)]
+            cropped = region_of_interest(edges, np.array([roi_v], np.int32))
+            
+            lines = cv2.HoughLinesP(cropped, 1, np.pi/180, 50, minLineLength=40, maxLineGap=100)
+            left, right = average_slope_intercept(frame, lines)
+            
+            # 조향 계산
+            angle, target = calculate_steering_angle(frame, left, right)
+            
+            # 서보값 매핑
+            servo_val = int(map_value(max(-45, min(45, angle)), -45, 45, SERVO_LEFT_MAX, SERVO_RIGHT_MAX))
+
+            # ---------------------------
+            # [C] 모터 제어 명령 전송
+            # ---------------------------
+            if ser:
+                # 상태에 따라 속도 0 또는 설정 속도 전송
+                ser.write(f"S,{servo_val}\n".encode())
+                ser.write(f"D,{current_speed}\n".encode())
+
+            # ---------------------------
+            # [D] 디버깅 화면
+            # ---------------------------
+            mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            
+            # 화면에 정보 표시
+            cv2.putText(frame, f"State: {status_msg}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+            cv2.putText(frame, f"Lidar: {int(lidar_d)}mm", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
+            cv2.putText(frame, f"Traffic: {traffic_status}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+            
+            # 신호등 ROI 영역 표시 (노란 박스)
+            cv2.rectangle(frame, (0, 0), (width, int(height*TRAFFIC_ROI_H)), (0, 255, 255), 2)
+            
+            combined = np.hstack((frame, mask_bgr))
+            out.write(combined)
+            cv2.imshow("Mission Drive", combined)
+            # 신호등 인식 확인용 (작은 창)
+            # cv2.imshow("Traffic ROI", roi_frame) 
+
+            if cv2.waitKey(1) == ord('q'):
+                print("🛑 사용자 중지")
+                break
+
+    finally:
+        shared_data["running"] = False
+        if HAS_LIDAR: t_lidar.join()
+        
+        if ser:
+            ser.write(b"D,0\n")
+            ser.write(b"S,570\n")
+            ser.close()
+            
+        out.release()
+        cap.release()
+        cv2.destroyAllWindows()
+        print("시스템 종료")
 
 if __name__ == "__main__":
     main()
