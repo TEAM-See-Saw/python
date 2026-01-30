@@ -23,8 +23,8 @@ STEER_WAIT_TIME = 0.8
 
 # ★ 튜닝 포인트: 감지 민감도
 # 종이 박스 인식이 잘 안되면 THRES_HIGH를 0.05 정도로 낮춰보세요.
-EDGE_THRES_HIGH = 0.10  # 10% 이상 엣지면 '차'
-EDGE_THRES_LOW = 0.03  # 3% 이하면 '빈 공간'
+EDGE_THRES_HIGH = 0.05  # 5% 이상 엣지면 '차'
+EDGE_THRES_LOW = 0.02  # 2% 이하면 '빈 공간'
 
 # ROI 설정 (화면 오른쪽 영역)
 ROI_X_RATIO = 0.60  # 화면 가로 60% 지점부터 오른쪽을 봄
@@ -71,7 +71,7 @@ def process_vision(frame):
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
     # ★ Canny 임계값 조절 (박스 인식률 높이려면 30, 100 정도로 낮춰보세요)
-    edges = cv2.Canny(blur, 50, 150)
+    edges = cv2.Canny(blur, 30, 80)
 
     # 3. 밀도 계산
     total_pixels = edges.size
