@@ -20,22 +20,22 @@ SPEED_STOP = 0
 SERVO_CENTER = 570
 SERVO_RIGHT_MAX = 440
 SERVO_LEFT_MAX = 680
-SERVO_SLIGHT_RIGHT = 560  # 벽타기용
+SERVO_SLIGHT_RIGHT = 555  # 벽타기용
 
 STEER_WAIT_TIME = 0.8
 
 # [시간 설정]
-TIME_SETUP_MOVE = 5.0  # 공간 확보 (전진)
+TIME_SETUP_MOVE = 7.0  # 공간 확보 (전진)
 TIME_REVERSE_TURN = 7.0  # 후진 진입 (회전)
-TIME_EXIT_TURN = 5.0  # 출차 회전 시간
+TIME_EXIT_TURN = 7.0  # 출차 회전 시간
 TIME_EXIT_ADJUST = 1.0  # 출차 전 보정(직진) 시간
 # TIME_EXIT_STRAIGHT = 2.0  <-- (삭제됨: 무한 직진이므로 필요 없음)
 
 TIME_DELAY_STOP = 1.5  # 감지 후 추가 이동 시간
 
 TARGET_PARK_X = -400
-CAR_EXIST_DIST = 1000
-EMPTY_SPACE_DIST = 2000
+CAR_EXIST_DIST = 2500
+EMPTY_SPACE_DIST = 3500
 
 SIDE_STOP_DIST = 700  # 70cm 이내 감지 시 정지
 
