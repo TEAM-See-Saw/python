@@ -2,215 +2,280 @@ import time
 import math
 import numpy as np
 import cv2
+import threading
+import serial
 
 # ==========================================
-# 1. 시뮬레이션 설정
+# 1. 설정 파라미터
 # ==========================================
-IS_SIMULATION = True
-WINDOW_W, WINDOW_H = 1000, 600  # 화면 크기 (가로, 세로)
-SCALE = 50                      # 1미터 = 50픽셀
+IS_SIMULATION = False  # 실제 주행 시 False
 
-# 주차장 맵 설정 (가상의 벽 좌표)
-# (시작점 x, y) -> (끝점 x, y)
-WALLS = [
-    [(0, 150), (400, 150)],    # 첫 번째 벽
-    [(600, 150), (1000, 150)], # 두 번째 벽 (중간에 400~600이 빈 공간)
-]
+# 포트 설정 (장치관리자 확인 필수)
+LIDAR_PORT = 'COM3'       # 라이다 포트
+ARDUINO_PORT = 'COM4'     # 아두이노 포트
+ARDUINO_BAUDRATE = 9600   # ★ 아두이노 코드와 일치 (9600)
 
-# 차량 설정
-CAR_LENGTH = 0.4  # 차 길이 (m)
-CAR_WIDTH = 0.2   # 차 폭 (m)
+# 주차 로직 튜닝
+PARKING_DEPTH_THRESHOLD = 1.2  # (m) 주차 공간 깊이
+READY_TIME = 1.5               # (초) 공간 발견 후 더 전진하는 시간
+STOP_DIST_MM = 200             # (mm) 후방 정지 거리 (아두이노가 mm 단위로 줌)
+
+# 조향(Steering) 매핑 설정 (아두이노 코드 기준)
+STEER_CENTER = 570
+STEER_LIMIT_MIN = 480  # 좌측 최대
+STEER_LIMIT_MAX = 680  # 우측 최대
+# 논리적 각도(-50~50)를 실제 값으로 변환하기 위한 비율
+# 대략 50도 꺾을 때 값이 110 변하므로 비율은 약 2.2
+STEER_RATIO = 2.2 
+
+# 시각화 설정
+WINDOW_SIZE = 600
+SCALE = 100 # 1m = 100px
 
 # ==========================================
-# 2. 로봇 하드웨어 (시뮬레이터 포함)
+# 2. 하드웨어 인터페이스 클래스
 # ==========================================
 class RobotHardware:
-    def __init__(self, simulation=False):
-        self.sim = simulation
+    def __init__(self):
         self.lidar = None
+        self.arduino = None
+        self.running = True
         
-        # [시뮬레이션용 로봇 상태]
-        self.x = 50.0   # 시작 위치 X (픽셀)
-        self.y = 300.0  # 시작 위치 Y (픽셀)
-        self.angle = 0.0 # 바라보는 각도 (라디안, 0=오른쪽)
-        self.speed = 0.0 # 현재 속도
-        self.steer = 0.0 # 조향 각도
-        self.last_time = time.time()
+        # 데이터 저장소
+        self.scan_data = [0.0] * 360
+        # 초음파 6개 [LF, LM, LT, RF, RM, RT] 순서 (mm 단위)
+        self.sonar_data = [9999] * 6 
 
-        if not self.sim:
-            # 실제 장비 연결 코드 (생략)
-            pass
-
-    def update_physics(self):
-        """시뮬레이션: 모터 값에 따라 차 위치 이동"""
-        if not self.sim: return
-
-        dt = time.time() - self.last_time
-        self.last_time = time.time()
-
-        # 간단한 자전거 모델 (Bicycle Model)
-        self.angle += (self.speed * math.tan(math.radians(self.steer)) / (CAR_LENGTH * SCALE)) * dt
-        self.x += self.speed * math.cos(self.angle) * dt
-        self.y += self.speed * math.sin(self.angle) * dt
-
-    def get_lidar_scan(self):
-        """현재 위치에서 벽까지의 거리 계산 (Ray Casting 흉내)"""
-        scan = [0.0] * 360
-        if self.sim:
-            # 시뮬레이션: 우측(90도)에 벽이 있는지 확인
-            # 내 위치(x)가 400~600 사이면 빈 공간(주차장 입구)
-            # Y좌표가 150(벽 위치)이므로 거리 = 내 Y - 150
+        # 1. 아두이노 연결
+        try:
+            self.arduino = serial.Serial(ARDUINO_PORT, ARDUINO_BAUDRATE, timeout=0.1)
+            time.sleep(2) # 아두이노 리셋 대기
+            print(f"✅ Arduino Connected: {ARDUINO_PORT}")
             
-            # 간단하게 우측 90도 방향만 계산
-            dist_to_wall = (self.y - 150) / SCALE # 미터 단위 변환
-            
-            # 주차 공간(X좌표 400~600)에 있으면 벽이 멀리 있음
-            if 400 < self.x < 600:
-                dist_right = 3.0 # 빈 공간 (3m)
-            else:
-                dist_right = dist_to_wall # 벽 있음
-            
-            # 노이즈 추가
-            for i in range(85, 95):
-                scan[i] = dist_right + np.random.uniform(-0.02, 0.02)
-        else:
-            # 실제 라이다 코드
-            pass
-            
-        return scan
+            # 수신 스레드 시작
+            self.serial_thread = threading.Thread(target=self._arduino_rx_thread)
+            self.serial_thread.daemon = True
+            self.serial_thread.start()
+        except Exception as e:
+            print(f"❌ Arduino 연결 실패: {e}")
 
-    def get_ultrasonic_rear(self):
-        """후방 센서 (Y좌표가 0에 가까워지면 값 작아짐)"""
-        if self.sim:
-            # 화면 위쪽(Y=0)을 벽이라고 가정
-            dist_cm = (self.y - 100) / SCALE * 100 # 임의의 후방 벽
-            return max(0, dist_cm)
-        return 999
+        # 2. 라이다 연결
+        if not IS_SIMULATION:
+            from rplidar import RPLidar
+            try:
+                self.lidar = RPLidar(LIDAR_PORT, baudrate=115200)
+                self.lidar.clean_input()
+                print(f"✅ Lidar Connected: {LIDAR_PORT}")
+                
+                self.lidar_thread = threading.Thread(target=self._lidar_thread)
+                self.lidar_thread.daemon = True
+                self.lidar_thread.start()
+            except Exception as e:
+                print(f"❌ Lidar 연결 실패: {e}")
 
-    def set_motor(self, speed, angle):
-        """속도 및 조향 설정 (시뮬레이션 물리엔진에 반영)"""
-        # 시뮬레이션상 속도 배율 보정
-        self.speed = speed * 3.0 
-        self.steer = angle
+    def _arduino_rx_thread(self):
+        """아두이노에서 오는 초음파 데이터 수신 (US:d1,d2,...)"""
+        while self.running and self.arduino:
+            try:
+                if self.arduino.in_waiting:
+                    line = self.arduino.readline().decode('utf-8', errors='ignore').strip()
+                    if line.startswith("US:"):
+                        # "US:100,200,300..." -> 파싱
+                        parts = line[3:].split(',')
+                        if len(parts) == 6:
+                            self.sonar_data = [int(p) for p in parts]
+            except Exception:
+                pass
+            time.sleep(0.01)
+
+    def _lidar_thread(self):
+        """라이다 데이터 수신"""
+        while self.running and self.lidar:
+            try:
+                for scan in self.lidar.iter_scans(max_buf_meas=5000):
+                    if not self.running: break
+                    for (_, angle, distance) in scan:
+                        angle_int = int(angle) % 360
+                        self.scan_data[angle_int] = distance / 1000.0 # m 단위로 변환
+            except:
+                # 에러 발생 시 재접속 시도
+                try:
+                    self.lidar.clean_input()
+                except: pass
+                time.sleep(0.1)
+
+    def get_lidar(self):
+        return list(self.scan_data)
+
+    def get_rear_distance(self):
+        """
+        후방 거리 반환 (mm)
+        아두이노 코드 순서: LF, LM, LT, RF, RM, RT
+        보통 마지막 2개(5, 6번)가 후방일 가능성이 높음.
+        여기서는 가장 마지막 센서(RT, index 5)를 후방이라고 가정.
+        필요하면 평균값 사용: (self.sonar_data[4] + self.sonar_data[5]) / 2
+        """
+        return self.sonar_data[5] 
+
+    def send_command(self, speed, angle_deg):
+        """
+        speed: -255 ~ 255 (음수: 후진)
+        angle_deg: -50(좌) ~ 50(우) -> 아두이노 POT 값으로 변환하여 전송
+        """
+        if not self.arduino: return
+
+        # 1. 조향각 변환 (Angle -> Potentiometer Value)
+        # angle_deg가 양수(우회전)면 POT값 증가, 음수면 감소
+        target_pot = STEER_CENTER + (angle_deg * STEER_RATIO)
+        
+        # 안전 범위 제한 (Clamp)
+        target_pot = max(STEER_LIMIT_MIN, min(STEER_LIMIT_MAX, target_pot))
+        target_pot = int(target_pot)
+
+        # 2. 속도 제한
+        target_speed = int(speed)
+
+        # 3. 명령 전송 (S:xxx\n 그리고 D:xxx\n)
+        try:
+            cmd_steer = f"S:{target_pot}\n"
+            cmd_drive = f"D:{target_speed}\n"
+            
+            self.arduino.write(cmd_steer.encode())
+            self.arduino.write(cmd_drive.encode())
+        except Exception as e:
+            print(f"Tx Error: {e}")
 
     def stop(self):
-        self.set_motor(0, 0)
+        self.send_command(0, 0) # 정지 명령
+        self.running = False
+        time.sleep(0.5)
+        if self.lidar:
+            try: self.lidar.stop(); self.lidar.disconnect()
+            except: pass
+        if self.arduino:
+            self.arduino.close()
+        print("Hardware Stopped.")
 
 # ==========================================
-# 3. 시각화 (Top-Down Map)
+# 3. 시각화 및 메인 로직
 # ==========================================
-def draw_global_map(robot, state):
-    # 회색 배경
-    img = np.full((WINDOW_H, WINDOW_W, 3), 50, dtype=np.uint8)
+def draw_screen(scan, state, rear_mm, steer_deg):
+    img = np.zeros((WINDOW_SIZE, WINDOW_SIZE, 3), dtype=np.uint8)
+    cx, cy = WINDOW_SIZE // 2, WINDOW_SIZE // 2
 
-    # 1. 벽 그리기 (주차 라인)
-    for wall in WALLS:
-        cv2.line(img, wall[0], wall[1], (0, 255, 255), 5) # 노란색 벽
-
-    # 2. 로봇 그리기 (회전된 사각형)
-    # 로봇 중심 좌표 및 회전 행렬 계산
-    rect = ((robot.x, robot.y), (CAR_LENGTH*SCALE*2, CAR_WIDTH*SCALE*2), math.degrees(robot.angle))
-    box = cv2.boxPoints(rect)
-    box = np.int0(box)
+    # 1. 차량 그리기
+    cv2.rectangle(img, (cx-20, cy-30), (cx+20, cy+30), (0, 0, 255), -1) # 차체
     
-    # 색상: 탐색중(초록), 주차중(파랑), 완료(빨강)
-    color = (0, 255, 0)
-    if state == "REVERSE": color = (255, 100, 0)
-    elif state == "STOP": color = (0, 0, 255)
-    
-    cv2.drawContours(img, [box], 0, color, -1)
-    
-    # 헤딩 방향 표시 (차 앞머리)
-    front_x = robot.x + 30 * math.cos(robot.angle)
-    front_y = robot.y + 30 * math.sin(robot.angle)
-    cv2.line(img, (int(robot.x), int(robot.y)), (int(front_x), int(front_y)), (0, 0, 0), 2)
+    # 조향 표시 (노란 선)
+    rad = math.radians(steer_deg - 90) # -90은 화면 좌표계 보정
+    ex = int(cx + 40 * math.cos(rad))
+    ey = int(cy + 40 * math.sin(rad))
+    cv2.line(img, (cx, cy-30), (ex, ey), (0, 255, 255), 3)
 
-    # 3. 정보 텍스트
-    cv2.putText(img, f"STATE: {state}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-    cv2.putText(img, f"POS: ({int(robot.x)}, {int(robot.y)})", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    # 2. 라이다 점 찍기
+    for i in range(360):
+        d = scan[i]
+        if 0.1 < d < 5.0:
+            th = math.radians(i - 90)
+            x = int(cx + d * SCALE * math.cos(th))
+            y = int(cy + d * SCALE * math.sin(th))
+            if 0 <= x < WINDOW_SIZE and 0 <= y < WINDOW_SIZE:
+                cv2.circle(img, (x, y), 2, (0, 255, 0), -1)
 
-    cv2.imshow("Parking Simulation (Top-Down)", img)
+    # 3. 텍스트 정보
+    cv2.putText(img, f"STATE: {state}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(img, f"REAR: {rear_mm} mm", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 200, 255), 1)
+    cv2.putText(img, f"STEER: {steer_deg} deg", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 255, 100), 1)
+
+    cv2.imshow("Car View", img)
     return cv2.waitKey(1) & 0xFF
 
-# ==========================================
-# 4. 메인 로직
-# ==========================================
 def main():
-    robot = RobotHardware(simulation=IS_SIMULATION)
+    robot = RobotHardware()
     state = "SEARCH"
     state_start_time = time.time()
     
-    # 파라미터 설정
-    PARKING_DEPTH_THRESHOLD = 1.5 # 1.5m 이상 뚫리면 주차공간
-    READY_TIME = 2.0  # 공간 발견 후 더 가는 시간
+    # 현재 명령 상태 변수
+    current_speed = 0
+    current_steer = 0
 
-    print("🚀 시뮬레이션 시작! (화면을 클릭하고 'q'를 누르면 종료)")
+    print("🚀 자율 주차 시스템 시작")
+    print("안전을 위해 잠시 대기 (2초)...")
+    time.sleep(2)
 
     try:
         while True:
-            # [중요] 시뮬레이션 물리 업데이트
-            robot.update_physics()
+            # 시간 측정
+            loop_start = time.time()
 
-            # 1. 센서 값 읽기
-            lidar_scan = robot.get_lidar_scan()
-            rear_dist_cm = robot.get_ultrasonic_rear()
+            # 1. 센서 데이터 획득
+            scan = robot.get_lidar()
+            rear_mm = robot.get_rear_distance()
 
-            # 우측 거리 평균 계산
-            right_dists = [d for d in lidar_scan[85:95] if d > 0.1]
-            avg_right_dist = np.mean(right_dists) if right_dists else 0.0
+            # 2. 데이터 가공 (우측 거리 측정: 85~95도 평균)
+            right_points = [scan[i] for i in range(85, 95) if scan[i] > 0.1]
+            avg_right_m = np.mean(right_points) if right_points else 0.0
 
-            # 2. 상태 머신 (로직)
+            # 3. 상태 머신 (로직)
             if state == "SEARCH":
-                # 직진하며 우측 탐색
-                robot.set_motor(20, 0) 
+                current_speed = 60    # 천천히 전진 (PWM)
+                current_steer = 0     # 직진
                 
-                # 우측 벽이 갑자기 멀어지면 (공간 발견)
-                if avg_right_dist > PARKING_DEPTH_THRESHOLD:
-                    print(f"✨ 주차 공간 발견! (거리: {avg_right_dist:.2f}m)")
+                # 우측에 공간이 생겼다면 (깊이가 깊어짐)
+                if avg_right_m > PARKING_DEPTH_THRESHOLD:
+                    print(f"✨ 공간 발견! (깊이: {avg_right_m:.2f}m)")
                     state = "READY"
                     state_start_time = time.time()
 
             elif state == "READY":
-                # 차를 주차 공간보다 조금 더 앞으로 보냄 (오버런)
-                robot.set_motor(20, 0)
+                current_speed = 60
+                current_steer = 0
+                # 차체 길이만큼 더 전진해서 평행주차 준비 위치 잡기
                 if time.time() - state_start_time > READY_TIME:
-                    print("🛑 정지! 후진 준비")
+                    print("🛑 위치 확보 완료. 정지 후 후진 준비.")
+                    state = "PAUSE"
+                    state_start_time = time.time()
+
+            elif state == "PAUSE":
+                current_speed = 0
+                current_steer = 0
+                if time.time() - state_start_time > 1.0: # 1초 정지
                     state = "REVERSE"
-                    robot.set_motor(0, 0)
-                    time.sleep(0.5)
 
             elif state == "REVERSE":
-                # 핸들을 오른쪽으로 꺾고 후진
-                # 시뮬레이션 좌표계상: 핸들(+), 속도(-) -> 우측 후방으로 휨
-                robot.set_motor(-15, 40) 
+                current_speed = -70   # 후진 (PWM)
+                current_steer = 50    # 핸들 우측 최대 (주차 공간으로 진입)
 
-                # 차가 충분히 안쪽(Y좌표 기준)으로 들어오면 정지
-                if robot.y < 200: 
-                    print("🛑 주차 완료!")
+                # 후방 센서 감지 시 정지
+                if 0 < rear_mm <= STOP_DIST_MM:
+                    print(f"🛑 후방 장애물 감지 ({rear_mm}mm). 주차 완료.")
                     state = "STOP"
                     state_start_time = time.time()
 
             elif state == "STOP":
-                robot.set_motor(0, 0)
-                if time.time() - state_start_time > 3.0:
-                    state = "EXIT"
-            
-            elif state == "EXIT":
-                 # 왼쪽으로 꺾어서 나감
-                robot.set_motor(20, -40)
-                if robot.y > 350: # 도로로 복귀하면 끝
+                current_speed = 0
+                current_steer = 0
+                if time.time() - state_start_time > 5.0:
+                    print("시스템 종료")
                     break
 
-            # 3. 화면 그리기
-            key = draw_global_map(robot, state)
+            # 4. 명령 전송 (★ 중요: 루프마다 계속 보내야 Failsafe 안 걸림)
+            robot.send_command(current_speed, current_steer)
+
+            # 5. 시각화
+            key = draw_screen(scan, state, rear_mm, current_steer)
             if key == ord('q'):
                 break
             
-            time.sleep(0.03) # 30ms 딜레이
+            # 루프 주기 조절 (약 20Hz)
+            dt = time.time() - loop_start
+            if dt < 0.05:
+                time.sleep(0.05 - dt)
 
     except KeyboardInterrupt:
-        print("종료")
+        print("\n강제 종료")
     finally:
+        robot.stop()
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
