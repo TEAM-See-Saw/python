@@ -18,15 +18,17 @@ VAL_LEFT = 680
 VAL_RIGHT = 480
 VAL_CENTER = 570
 
-# 속도값 (음수값을 넣으면 후진합니다)
-SPEED_FWD = 255  # 전진 속도
-SPEED_STOP = 0  # 정지
-SPEED_BWD = -255  # ★ [추가] 후진 속도 (너무 빠르면 -150 정도로 줄이세요)
+# 속도값
+SPEED_FWD = 255
+SPEED_STOP = 0
+SPEED_BWD = -255
+
+# ★ [추가] 통신 주기 설정 (0.1초마다 재전송)
+SERIAL_INTERVAL = 0.1
 
 # ==========================================
 # [2] 초기화
 # ==========================================
-# 1. 아두이노
 try:
     ser = serial.Serial(PORT, BAUDRATE, timeout=1)
     time.sleep(2)
@@ -34,12 +36,10 @@ except Exception as e:
     print(f"❌ 아두이노 연결 실패: {e}")
     exit()
 
-# 2. 카메라
 cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
 cap.set(3, 640)
 cap.set(4, 480)
 
-# 3. 파일 저장 설정
 now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 video_filename = f"drive_data_{now}.mp4"
 csv_filename = f"drive_data_{now}.csv"
@@ -61,14 +61,18 @@ last_steer_val = VAL_CENTER
 last_motor_speed = SPEED_STOP
 start_time = time.time()
 
+# ★ [추가] 마지막 전송 시간 기록용 변수
+last_serial_send_time = 0
+
 try:
     while True:
         ret, frame = cap.read()
         if not ret: break
         frame = cv2.resize(frame, (640, 480))
 
+        current_time = time.time()
+
         # --- 1. 키보드 입력 처리 ---
-        # (1) 조향
         if keyboard.is_pressed('left'):
             curr_steer = VAL_LEFT
             steer_text = "LEFT"
@@ -79,35 +83,40 @@ try:
             curr_steer = VAL_CENTER
             steer_text = "CENTER"
 
-        # (2) 구동 (후진 로직 추가됨)
         if keyboard.is_pressed('up'):
             curr_speed = SPEED_FWD
             motor_text = "FWD"
         elif keyboard.is_pressed('down'):
-            curr_speed = SPEED_BWD  # ★ [수정] 후진 속도 적용
-            motor_text = "BWD"  # ★ [수정] 텍스트 변경
+            curr_speed = SPEED_BWD
+            motor_text = "BWD"
         else:
             curr_speed = SPEED_STOP
             motor_text = "STOP"
 
-        # --- 2. 아두이노 전송 ---
-        if curr_steer != last_steer_val:
-            ser.write(f"S,{curr_steer}\n".encode())
-            last_steer_val = curr_steer
+        # --- 2. 아두이노 전송 (수정됨: 하트비트 로직) ---
+        # 값이 바뀌었거나(Change), 마지막 전송 후 0.1초가 지났으면(Timeout) 전송
+        should_send = False
 
-        if curr_speed != last_motor_speed:
+        if (curr_steer != last_steer_val) or (curr_speed != last_motor_speed):
+            should_send = True
+        elif (current_time - last_serial_send_time > SERIAL_INTERVAL):
+            should_send = True
+
+        if should_send:
+            # 안전을 위해 조향과 속도를 둘 다 보냅니다 (명령 씹힘 방지)
+            ser.write(f"S,{curr_steer}\n".encode())
             ser.write(f"D,{curr_speed}\n".encode())
+
+            last_steer_val = curr_steer
             last_motor_speed = curr_speed
+            last_serial_send_time = current_time  # 시간 갱신
 
         # --- 3. 데이터 로깅 ---
-        elapsed_time = round(time.time() - start_time, 3)
-        # CSV에는 음수 속도(-200)도 그대로 기록되어 나중에 학습할 때 유용합니다.
-        csv_writer.writerow([elapsed_time, last_steer_val, last_motor_speed])
+        elapsed_time = round(current_time - start_time, 3)
+        csv_writer.writerow([elapsed_time, curr_steer, curr_speed])  # 현재 키보드 상태 기준 기록
 
         # --- 4. 화면 표시 ---
         cv2.putText(frame, f"Time: {elapsed_time}s", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-        # 후진일 때 빨간색 글씨로 표시
         color = (0, 0, 255) if curr_speed < 0 else (0, 255, 0)
         cv2.putText(frame, f"Cmd: {steer_text} | {motor_text}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
