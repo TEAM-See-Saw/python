@@ -35,27 +35,27 @@ ROI_TRAFFIC_HEIGHT = ROI_LANE_HEIGHT_RATIO - 0.05
 ROI_LANE_X_LEFT = 0.3125
 ROI_LANE_X_RIGHT = 0.6875
 
-# --- 횡단보도 설정 ---
-CROSSWALK_RATIO_MIN = 0.30  # 30% 이상이면 횡단보도
+# --- 횡단보도(정지선) 설정 ---
+CROSSWALK_RATIO_MIN = 0.30 # roi 30%가 흰색이면 횡단보도라고 판단
 CROSSWALK_MAX_WAIT = 7.0
 CROSSWALK_COOLDOWN = 5.0
+CROSSWALK_CONFIRM_TIME = 0.2  # 0.2초 이상 연속 감지 시 정지
 
-# --- ★ [추가] 자동 튜닝 설정 (Auto-Tuning) ---
-# 목표: 흰색 비율을 3% ~ 10% 사이로 유지
+# --- 자동 튜닝 설정 (Auto-Tuning) ---
 TARGET_RATIO_MIN = 0.03
 TARGET_RATIO_MAX = 0.10
 
 if IS_SUNNY:
     print("☀️ 모드: SUNNY (Auto-Tuning ON)")
-    current_l_min = 200  # 시작값 (높게)
-    MIN_L_VAL = 150  # 너무 어두워지지 않게 하한선 방어
-    MAX_L_VAL = 240  # 상한선
+    current_l_min = 200
+    MIN_L_VAL = 150
+    MAX_L_VAL = 240
     S_MAX = 50
     MORPH_SIZE = (5, 5)
     BLUR_K = 7
 else:
     print("🌙 모드: NORMAL (Auto-Tuning ON)")
-    current_l_min = 140  # 시작값 (평범하게)
+    current_l_min = 140
     MIN_L_VAL = 80
     MAX_L_VAL = 220
     S_MAX = 80
@@ -136,6 +136,38 @@ def map_servo(angle):
     return int((angle - (-45)) * (SERVO_RIGHT_MAX - SERVO_LEFT_MAX) / (45 - (-45)) + SERVO_LEFT_MAX)
 
 
+# ★ [신규 함수] 가로선(Stop Line) 감지
+def detect_stop_line(frame, roi_ratio=0.6):
+    h, w = frame.shape[:2]
+    # ROI: 화면 하단부 (차선 보는 높이와 비슷하게)
+    roi_h = int(h * roi_ratio)
+    roi = frame[roi_h:h, 0:w]
+
+    # 전처리: Gray -> Blur -> Threshold -> Canny
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    # 임계값 160: 꽤 밝은 흰색만 잡음 (환경에 따라 140~200 조절)
+    _, thresh = cv2.threshold(blur, 160, 255, cv2.THRESH_BINARY)
+    edges = cv2.Canny(thresh, 50, 150)
+
+    # 허프 변환 (직선 검출)
+    # minLineLength=60: 최소 60픽셀 이상이어야 선으로 인정 (짧은 노이즈 제거)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=30, minLineLength=60, maxLineGap=20)
+
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            if x2 - x1 == 0: continue  # 수직선 예외처리
+            angle = np.arctan2(y2 - y1, x2 - x1) * 180.0 / np.pi
+
+            # 수평선 판정: 기울기가 ±15도 이내
+            if abs(angle) < 15:
+                # 디버깅용: 원본 프레임에 초록색 선 그리기
+                cv2.line(frame, (x1, y1 + roi_h), (x2, y2 + roi_h), (0, 255, 0), 3)
+                return True
+    return False
+
+
 # ==========================================
 # [3] 초기화
 # ==========================================
@@ -177,6 +209,7 @@ last_speed_time = 0
 is_crosswalk_stop = False
 crosswalk_start_time = 0
 crosswalk_cooldown_timer = 0
+crosswalk_detect_timer = 0  # ★ 지속성 검사용 타이머
 
 try:
     print("🚀 Auto-Tuning 주행 시작!")
@@ -197,7 +230,6 @@ try:
         blurred = cv2.medianBlur(frame, BLUR_K)
         hls = cv2.cvtColor(blurred, cv2.COLOR_BGR2HLS)
 
-        # ★ [핵심] 자동 튜닝된 current_l_min 값 적용
         mask = cv2.inRange(hls, np.array([0, current_l_min, 0]), np.array([179, 255, S_MAX]))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones(MORPH_SIZE, np.uint8))
 
@@ -206,7 +238,7 @@ try:
         traffic_frame = frame[0:traffic_roi_h, :]
         traffic_light = camera.object_detection(traffic_frame, sample=3, print_enable=False)
 
-        # 4. 흰색 비율 계산 (차선 ROI 기준)
+        # 4. 흰색 비율 계산
         lane_roi_points = np.array([[
             (0, h), (w, h),
             (int(w * ROI_LANE_X_RIGHT), int(h * ROI_LANE_HEIGHT_RATIO)),
@@ -222,13 +254,12 @@ try:
         if total_area == 0: total_area = 1
         ratio = white_count / total_area
 
-        # ★ [핵심] Auto-Tuning 로직 (횡단보도 아닐 때만 작동)
-        # 횡단보도(비율 > 30%)일 때 튜닝하면 L_MIN이 폭주하므로 막아야 함
+        # Auto-Tuning (횡단보도 아닐 때만)
         if ratio < CROSSWALK_RATIO_MIN:
             if ratio > TARGET_RATIO_MAX:
-                current_l_min = min(current_l_min + 2, MAX_L_VAL)  # 너무 밝으면 기준 올림
+                current_l_min = min(current_l_min + 2, MAX_L_VAL)
             elif ratio < TARGET_RATIO_MIN:
-                current_l_min = max(current_l_min - 2, MIN_L_VAL)  # 너무 어두우면 기준 낮춤
+                current_l_min = max(current_l_min - 2, MIN_L_VAL)
 
         # ==========================================================
         # 미션 & 주행 로직
@@ -238,42 +269,64 @@ try:
         final_speed = SPEED_NORMAL
         current_time = time.time()
 
-        # (1) 횡단보도 정지
+        # (1) 이미 정지 중 (신호 대기)
         if is_crosswalk_stop:
             final_speed = SPEED_STOP
             elapsed = current_time - crosswalk_start_time
 
-            if traffic_light == "GREEN":  # 초록불 출발
+            if traffic_light == "GREEN":
                 is_crosswalk_stop = False
                 crosswalk_cooldown_timer = current_time
+                crosswalk_detect_timer = 0
                 print(f"🟢 Green Light! Go!")
-            elif elapsed > CROSSWALK_MAX_WAIT:  # 7초 타임아웃 출발
+            elif elapsed > CROSSWALK_MAX_WAIT:
                 is_crosswalk_stop = False
                 crosswalk_cooldown_timer = current_time
+                crosswalk_detect_timer = 0
                 print(f"⚠️ Timeout! Go!")
             else:
                 status_msg = f"WAIT GREEN.. ({elapsed:.1f}s)"
                 status_color = (0, 0, 255)
 
-        # (2) 횡단보도 감지
+        # (2) 횡단보도(정지선) 감지 로직 [수정됨]
+        # 조건: 쿨타임 지남 AND 비율 15% 이상
         elif (ratio > CROSSWALK_RATIO_MIN) and (current_time - crosswalk_cooldown_timer > CROSSWALK_COOLDOWN):
-            is_crosswalk_stop = True
-            crosswalk_start_time = current_time
-            final_speed = SPEED_STOP
-            status_msg = "CROSSWALK STOP"
-            status_color = (0, 0, 255)
 
-        # (3) 신호등 정지
-        elif traffic_light == "RED":
-            final_speed = SPEED_STOP
-            status_msg = "TRAFFIC RED"
-            status_color = (0, 0, 255)
+            # 조건: 가로선(Stop Line)이 있는가?
+            if detect_stop_line(frame, ROI_LANE_HEIGHT_RATIO):
+                # 가로선 확인됨 -> 타이머 체크
+                if crosswalk_detect_timer == 0:
+                    crosswalk_detect_timer = current_time
 
-        # (4) 장애물 감속
-        elif raw_dist < 800:
-            final_speed = SPEED_SLOW
-            status_msg = f"OBSTACLE ({int(raw_dist)}mm)"
-            status_color = (0, 255, 255)
+                # 0.2초 이상 유지되면 정지
+                elif current_time - crosswalk_detect_timer > CROSSWALK_CONFIRM_TIME:
+                    is_crosswalk_stop = True
+                    crosswalk_start_time = current_time
+                    final_speed = SPEED_STOP
+                    status_msg = "STOP LINE DETECTED!"
+                    status_color = (0, 0, 255)
+                    crosswalk_detect_timer = 0
+                else:
+                    status_msg = "Checking Line..."
+            else:
+                # 비율은 높지만 가로선이 없음 (햇빛/노이즈) -> 타이머 초기화
+                crosswalk_detect_timer = 0
+                if ratio > 0.3: status_msg = "Glare Ignored"
+
+        # (3) 비율 정상화 -> 타이머 초기화
+        else:
+            crosswalk_detect_timer = 0
+
+            # 신호등 정지
+            if traffic_light == "RED":
+                final_speed = SPEED_STOP
+                status_msg = "TRAFFIC RED"
+                status_color = (0, 0, 255)
+            # 장애물 감속
+            elif raw_dist < 800:
+                final_speed = SPEED_SLOW
+                status_msg = f"OBSTACLE ({int(raw_dist)}mm)"
+                status_color = (0, 255, 255)
 
         # ----------------------------------------
         # 5. 조향 & 통신
@@ -303,10 +356,8 @@ try:
         cv2.line(frame, (0, traffic_roi_h), (w, traffic_roi_h), (100, 100, 100), 1)
         cv2.circle(frame, (target_px, int(h * ROI_LANE_HEIGHT_RATIO)), 10, (0, 0, 255), -1)
 
-        # 튜닝 정보 출력 (왼쪽 상단)
         tune_info = f"L-Min: {current_l_min} | Ratio: {ratio * 100:.1f}%"
         cv2.putText(frame, tune_info, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
         cv2.putText(frame, f"Light: {traffic_light}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
         cv2.putText(frame, status_msg, (20, traffic_roi_h + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
 
