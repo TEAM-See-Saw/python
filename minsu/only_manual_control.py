@@ -8,7 +8,7 @@ import cv2
 # ==========================================
 CAM_INDEX = 0
 PORT = 'COM4'
-BAUDRATE = 115200
+BAUDRATE = 115200 # ★ 아두이노와 속도 일치
 
 # 조향값
 VAL_LEFT = 680
@@ -16,11 +16,11 @@ VAL_RIGHT = 480
 VAL_CENTER = 570
 
 # 속도값
-SPEED_FWD = 255  # 전진
-SPEED_STOP = 0  # 정지
-SPEED_BWD = -255  # 후진
+SPEED_FWD = 255
+SPEED_STOP = 0
+SPEED_BWD = -255
 
-# ★ [추가] 통신 주기 (0.1초마다 재전송 -> 꾹 눌러도 안 멈춤)
+# 통신 주기 (0.1초마다 재전송)
 SERIAL_INTERVAL = 0.1
 
 # ==========================================
@@ -30,6 +30,7 @@ SERIAL_INTERVAL = 0.1
 try:
     ser = serial.Serial(PORT, BAUDRATE, timeout=1)
     time.sleep(2)
+    ser.reset_input_buffer() # 시작 전 청소
     print("✅ 아두이노 연결 성공")
 except Exception as e:
     print(f"❌ 아두이노 연결 실패: {e}")
@@ -48,12 +49,19 @@ print("🎮 조작: ↑(전진), ↓(후진), ← →(조향), ESC(종료)")
 # ==========================================
 last_steer_val = VAL_CENTER
 last_motor_speed = SPEED_STOP
-
-# ★ [추가] 마지막 전송 시간 기록
 last_serial_send_time = 0
 
 try:
     while True:
+        # ==========================================================
+        # ★ [핵심 추가] 아두이노 데이터 쓰레기통 비우기
+        # ==========================================================
+        # 녹화를 안 해도 아두이노는 데이터를 계속 보내므로,
+        # 안 비워주면 19초 뒤에 버퍼가 꽉 차서 멈춥니다.
+        if ser.in_waiting > 0:
+            ser.reset_input_buffer()
+        # ==========================================================
+
         ret, frame = cap.read()
         if not ret: break
 
@@ -61,7 +69,6 @@ try:
         current_time = time.time()
 
         # --- 1. 키보드 입력 처리 ---
-        # (1) 조향
         if keyboard.is_pressed('left'):
             curr_steer = VAL_LEFT
             steer_text = "LEFT"
@@ -72,7 +79,6 @@ try:
             curr_steer = VAL_CENTER
             steer_text = "CENTER"
 
-        # (2) 구동
         if keyboard.is_pressed('up'):
             curr_speed = SPEED_FWD
             motor_text = "FWD"
@@ -84,7 +90,6 @@ try:
             motor_text = "STOP"
 
         # --- 2. 아두이노 전송 (하트비트 적용) ---
-        # 값이 바뀌었거나 OR 마지막 전송 후 0.1초 지났으면 전송
         should_send = False
 
         if (curr_steer != last_steer_val) or (curr_speed != last_motor_speed):
@@ -93,17 +98,18 @@ try:
             should_send = True
 
         if should_send:
-            # 안전하게 둘 다 보냄
-            ser.write(f"S,{curr_steer}\n".encode())
-            ser.write(f"D,{curr_speed}\n".encode())
+            try:
+                ser.write(f"S,{curr_steer}\n".encode())
+                ser.write(f"D,{curr_speed}\n".encode())
 
-            last_steer_val = curr_steer
-            last_motor_speed = curr_speed
-            last_serial_send_time = current_time
+                last_steer_val = curr_steer
+                last_motor_speed = curr_speed
+                last_serial_send_time = current_time
+            except Exception as e:
+                print(f"전송 오류: {e}")
 
         # --- 3. 화면 표시 ---
         color = (0, 0, 255) if curr_speed < 0 else (0, 255, 0)
-
         cv2.putText(frame, f"Steer: {steer_text}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
         cv2.putText(frame, f"Motor: {motor_text}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
