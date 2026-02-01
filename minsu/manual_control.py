@@ -11,7 +11,7 @@ import os
 # ==========================================
 CAM_INDEX = 0
 PORT = 'COM4'
-BAUDRATE = 9600
+BAUDRATE = 115200
 
 # 조향값
 VAL_LEFT = 680

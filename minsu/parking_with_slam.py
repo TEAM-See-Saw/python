@@ -68,12 +68,14 @@ sonar_data = [999] * 6
 
 def read_sensors():
     global sonar_data
-    if ser.in_waiting > 0:
+    # 데이터가 있으면 싹 다 읽어서 마지막 것만 취함 (Flush 개념)
+    while ser.in_waiting > 0:
         try:
             line = ser.readline().decode('utf-8').strip()
             if line.startswith("US:"):
                 parts = line.replace("US:", "").split(",")
-                if len(parts) == 6: sonar_data = [int(p) for p in parts]
+                if len(parts) == 6:
+                    sonar_data = [int(p) for p in parts]
         except:
             pass
 
@@ -108,7 +110,7 @@ def main():
     cv2.namedWindow("Parking Monitor")
 
     try:
-        ser = serial.Serial(PORT, 9600, timeout=0.1)
+        ser = serial.Serial(PORT, 115200, timeout=0.1)
         lidar = RPLidar(LIDAR_PORT)
         print("✅ 시스템 연결")
         time.sleep(1)

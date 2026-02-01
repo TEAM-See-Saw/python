@@ -18,7 +18,7 @@ SERIAL_DELAY = 0.05
 SPEED_REFRESH_DELAY = 1.0
 
 # --- 속도 & 모터 설정 ---
-SPEED_NORMAL = 200
+SPEED_NORMAL = 100
 SPEED_SLOW = 100
 SPEED_STOP = 0
 SERVO_CENTER = 570
@@ -177,7 +177,7 @@ cam0 = None;
 video_writer = None
 
 try:
-    ser = serial.Serial(ARDUINO_PORT, 9600, timeout=0.1)
+    ser = serial.Serial(ARDUINO_PORT, 115200, timeout=0.1)
     lidar = RPLidar(LIDAR_PORT)
     camera = libCAMERA()
     cam0, _ = camera.initial_setting(capnum=1)
