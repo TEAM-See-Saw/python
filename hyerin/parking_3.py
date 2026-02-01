@@ -6,68 +6,102 @@ import cv2
 from collections import deque
 
 # ==========================================
-# [1] 설정값
+# [1] 포트/속도/서보 설정
 # ==========================================
-PORT = 'COM4'
-LIDAR_PORT = 'COM3'
+PORT = "COM4"
+LIDAR_PORT = "COM3"
 
-SPEED_CRUISE = 70
-SPEED_TURNIN = 60
-SPEED_PARKIN = 55
+SPEED_CRUISE = 70     # 빨간 경로 따라 좌로 직진(탐색)
+SPEED_TURNIN = 60     # 우회전 진입
+SPEED_PARKIN = 55     # 주차 직진
 SPEED_STOP = 0
 
-# 서보 모터 설정
 SERVO_CENTER = 570
 SERVO_RIGHT_MAX = 440
 SERVO_LEFT_MAX = 680
-SERVO_SLIGHT_RIGHT = 555
 
-STEER_WAIT_TIME = 0.6
+STEER_WAIT_TIME = 0.6  # 조향 안정 대기
 
-# ---- 라이다 튐 완화 ----
-LIDAR_TEMPORAL_N = 5
-LIDAR_PCTL = 10  # 하위 10% 지점
+# ==========================================
+# [2] 치수 반영 (mm)
+# ==========================================
+CAR_W = 750      # 차량 폭(짧은쪽) 75cm
+CAR_L = 1000     # 차량 길이(긴쪽) 100cm
+SLOT_W = 950     # 주차면 폭(짧은쪽) 95cm
+SLOT_L = 1500    # 주차면 길이(긴쪽) 150cm
 
-# ---- “오른쪽에 주차된 차” 감지 임계값(튜닝 포인트) ----
-RIGHT_CAR_DIST = 1600   # 오른쪽(주차칸 방향)에 물체가 이 거리 이하면 "차 있음"
-RIGHT_GAP_DIST = 2600   # 오른쪽이 이 거리 이상이면 "갭(빈칸)로 간주"
-GAP_STREAK = 3          # 몇 번 연속으로 갭이면 진짜 갭으로 인정
-CAR_STREAK = 3          # 몇 번 연속으로 차면 진짜 차로 인정
+SIDE_CLEAR_TOTAL = SLOT_W - CAR_W        # 200mm
+SIDE_CLEAR_EACH = SIDE_CLEAR_TOTAL / 2   # 100mm
 
-# ---- 갭 중앙으로 들어가기 위한 시간 기반 보정(튜닝 포인트) ----
-TIME_TO_CENTER_IN_GAP = 1.0   # 갭 진입 후 중앙까지 더 직진(좌로 이동) 시간
-TIME_TURN_IN = 2.0            # 우회전으로 상단 주차칸 진입 시간
-TIME_STRAIGHT_IN_MAX = 4.0    # 직진 주차 최대 시간(안전 타임아웃)
+FR_REAR_CLEAR_TOTAL = SLOT_L - CAR_L     # 500mm
+TARGET_FRONT_CLEAR = 250                 # 앞쪽 250mm 남기고 정지 권장
 
-# ---- 주차 종료(전방 벽/끝) 감지 ----
-PARK_FRONT_STOP_DIST = 500    # 전방(0도 섹터) 이내면 정지 (mm)
+# 전방(주차칸 안쪽 끝) 감지 기준: 25cm 남기고 정지
+PARK_FRONT_STOP_DIST = 250  # (기존 500보다 타이트)
 
-# 초음파(있으면 안전용으로만 사용) - 네 코드 그대로 유지
+# ==========================================
+# [3] 라이다 튐 완화/섹터 정의
+# ==========================================
+LIDAR_TEMPORAL_N = 5     # 최근 N개 median
+LIDAR_PCTL = 10          # 섹터 거리 중 하위 10% 퍼센타일 (min보다 안정적)
+
+# 오른쪽(주차칸 방향) 섹터: 270 ± 20
+RIGHT_SECTOR = (250, 290)
+# 왼쪽(반대쪽) 섹터: 90 ± 20
+LEFT_SECTOR = (70, 110)
+# 전방 섹터: 350~360 + 0~20
+FRONT_SECTOR_WRAP = (350, 20)
+
+# ==========================================
+# [4] 주차칸(갭) 인식 임계값
+# ==========================================
+# "오른쪽에 차 있음" / "오른쪽이 확 넓음(갭)"
+RIGHT_CAR_DIST = 1600     # 이하면 오른쪽에 차(장애물) 존재
+RIGHT_GAP_DIST = 2600     # 이상이면 오른쪽이 비어있다(갭)
+CAR_STREAK = 3            # 연속 N회면 확정
+GAP_STREAK = 3
+
+# 갭 중앙 보정/진입/주차 타임 파라미터
+TIME_TO_CENTER_IN_GAP = 0.9  # 갭 감지 후 중앙까지 더 직진(좌로 이동)
+TIME_TURN_IN = 2.0           # 우회전으로 주차칸 진입
+TIME_STRAIGHT_IN_MAX = 4.0   # 직진 주차 최대 시간(안전 타임아웃)
+
+# ==========================================
+# [5] 폭이 타이트(여유 10cm/측면) → 센터링 제어
+# ==========================================
+CENTER_KP = 0.04          # mm 오차 -> 서보 보정량 스케일 (0.02~0.08 튜닝)
+CENTER_SERVO_LIMIT = 28   # 중앙 기준 최대 ±28만 미세 조향(과조향 방지)
+CENTER_DEADBAND = 30      # 오차가 ±30mm 이내면 보정하지 않음(진동 방지)
+
+# ==========================================
+# [6] 초음파(있으면 안전용)
+# ==========================================
 sonar_data = [999] * 6
 IDX_LT = 2
 IDX_RT = 5
-REAR_URGENT = 120
+REAR_URGENT = 120  # 12cm 이내면 즉시 정지(안전)
 
 # ==========================================
-# [2] 상태 정의
+# [7] 상태 정의 (경로 기반)
 # ==========================================
-STATE_CRUISE = 0          # 빨간선대로 좌로 직진 이동(탐색)
+STATE_CRUISE = 0          # 빨간 경로대로 좌로 직진 이동(탐색 준비)
 STATE_FIND_FIRST_CAR = 1  # 오른쪽 첫 번째 파란차 찾기
-STATE_FIND_GAP = 2        # 첫 차 지나고 갭 찾기
+STATE_FIND_GAP = 2        # 첫 차 이후 갭(빈칸) 찾기
 STATE_CENTER_GAP = 3      # 갭 중앙까지 이동
 STATE_TURN_IN = 4         # 우회전 진입
-STATE_STRAIGHT_IN = 5     # 직진으로 주차 마무리
+STATE_STRAIGHT_IN = 5     # 직진 주차 마무리(센터링 포함)
 STATE_PARKED = 6
 STATE_PAUSE = 99
 
 # ==========================================
-# [3] 센서/라이다 유틸
+# [8] 센서/라이다 유틸
 # ==========================================
 def read_sensors():
+    """아두이노에서 'US:x,x,x,x,x,x' 형태로 초음파 6채널 수신."""
     global sonar_data
     if ser.in_waiting > 0:
         try:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
+            line = ser.readline().decode("utf-8", errors="ignore").strip()
             if line.startswith("US:"):
                 parts = line.replace("US:", "").split(",")
                 if len(parts) == 6:
@@ -77,7 +111,7 @@ def read_sensors():
 
 
 def percentile_in_sector(scan, start_angle, end_angle, percentile=10):
-    """start_angle~end_angle 섹터의 dist 모아서 하위 퍼센타일."""
+    """start_angle~end_angle 섹터의 dist들을 모아 하위 퍼센타일을 반환."""
     dists = []
     for (_, angle, dist) in scan:
         if dist <= 0:
@@ -90,24 +124,17 @@ def percentile_in_sector(scan, start_angle, end_angle, percentile=10):
 
 
 def percentile_wrap_sector(scan, start_angle, end_angle, percentile=10):
-    """
-    wrap 지원 섹터 (예: 350~360 + 0~20 같은 전방)
-    """
+    """wrap 섹터 지원(예: 350~20)."""
     if start_angle <= end_angle:
         return percentile_in_sector(scan, start_angle, end_angle, percentile)
 
-    # wrap case
-    d1 = []
-    d2 = []
+    dists = []
     for (_, angle, dist) in scan:
         if dist <= 0:
             continue
-        if angle >= start_angle:
-            d1.append(dist)
-        elif angle <= end_angle:
-            d2.append(dist)
+        if angle >= start_angle or angle <= end_angle:
+            dists.append(dist)
 
-    dists = d1 + d2
     if not dists:
         return 9999.0
     return float(np.percentile(np.array(dists, dtype=np.float32), percentile))
@@ -115,11 +142,17 @@ def percentile_wrap_sector(scan, start_angle, end_angle, percentile=10):
 
 def temporal_median(buf: deque, v: float):
     buf.append(v)
-    return float(np.median(np.array(buf, dtype=np.float32))) if buf else 9999.0
+    if not buf:
+        return 9999.0
+    return float(np.median(np.array(buf, dtype=np.float32)))
+
+
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
 
 
 # ==========================================
-# [4] 메인
+# [9] 메인
 # ==========================================
 def main():
     global ser, lidar
@@ -141,8 +174,9 @@ def main():
     time.sleep(1.0)
 
     # 라이다 smoothing 버퍼
-    buf_right = deque(maxlen=LIDAR_TEMPORAL_N)  # 오른쪽(270 근처)
-    buf_front = deque(maxlen=LIDAR_TEMPORAL_N)  # 전방(0 근처)
+    buf_right = deque(maxlen=LIDAR_TEMPORAL_N)
+    buf_left = deque(maxlen=LIDAR_TEMPORAL_N)
+    buf_front = deque(maxlen=LIDAR_TEMPORAL_N)
 
     # 상태/카운터
     state = STATE_CRUISE
@@ -151,6 +185,7 @@ def main():
     car_cnt = 0
     gap_cnt = 0
 
+    # PAUSE 관리
     pause_start_time = 0.0
     pause_duration = 0.0
     next_state = STATE_CRUISE
@@ -167,15 +202,16 @@ def main():
                 read_sensors()
                 curr_time = time.time()
 
-                # 오른쪽(주차칸 방향) = 270 ± 20 정도를 섹터로 잡음
-                right_raw = percentile_in_sector(scan, 250, 290, LIDAR_PCTL)
-                right_dist = temporal_median(buf_right, right_raw)
+                # ---- 라이다: 오른쪽/왼쪽/전방 거리 ----
+                right_raw = percentile_in_sector(scan, RIGHT_SECTOR[0], RIGHT_SECTOR[1], LIDAR_PCTL)
+                left_raw = percentile_in_sector(scan, LEFT_SECTOR[0], LEFT_SECTOR[1], LIDAR_PCTL)
+                front_raw = percentile_wrap_sector(scan, FRONT_SECTOR_WRAP[0], FRONT_SECTOR_WRAP[1], LIDAR_PCTL)
 
-                # 전방(0도 주변) = 350~360 + 0~20
-                front_raw = percentile_wrap_sector(scan, 350, 20, LIDAR_PCTL)
+                right_dist = temporal_median(buf_right, right_raw)
+                left_dist = temporal_median(buf_left, left_raw)
                 front_dist = temporal_median(buf_front, front_raw)
 
-                # 초음파(긴급용)
+                # 초음파(안전용)
                 dist_LT = sonar_data[IDX_LT]
                 dist_RT = sonar_data[IDX_RT]
 
@@ -188,6 +224,7 @@ def main():
                 # =========================
                 if state == STATE_PAUSE:
                     cmd_speed = 0
+                    cmd_servo = SERVO_CENTER
                     msg = f"WAIT... ({pause_msg})"
                     if curr_time - pause_start_time > pause_duration:
                         state = next_state
@@ -202,9 +239,9 @@ def main():
                 elif state == STATE_CRUISE:
                     cmd_servo = SERVO_CENTER
                     cmd_speed = SPEED_CRUISE
-                    msg = "CRUISE LEFT -> SEARCH RIGHT CARS"
+                    msg = "CRUISE -> SEARCH RIGHT CARS"
 
-                    # 바로 검색하면 시작구간 잡음이 있을 수 있어 1초는 그냥 감
+                    # 시작 잡음 제거용 1초
                     if curr_time - state_timer > 1.0:
                         state = STATE_FIND_FIRST_CAR
                         state_timer = curr_time
@@ -230,14 +267,13 @@ def main():
                         car_cnt = 0
 
                 # =========================
-                # [2] 갭(빈칸) 찾기: 차 -> 빈칸 패턴
+                # [2] 갭(빈칸) 찾기
                 # =========================
                 elif state == STATE_FIND_GAP:
                     cmd_servo = SERVO_CENTER
                     cmd_speed = SPEED_CRUISE
                     msg = f"FIND GAP | R={int(right_dist)}"
 
-                    # 갭은 오른쪽이 확 넓어지는 구간
                     if right_dist > RIGHT_GAP_DIST:
                         gap_cnt += 1
                         if gap_cnt >= GAP_STREAK:
@@ -257,7 +293,6 @@ def main():
                     msg = f"CENTER GAP... {dt:.1f}/{TIME_TO_CENTER_IN_GAP}s"
 
                     if dt >= TIME_TO_CENTER_IN_GAP:
-                        # 잠깐 멈추고 조향 안정
                         ser.write(b"D,0\n")
                         state = STATE_PAUSE
                         next_state = STATE_TURN_IN
@@ -267,11 +302,11 @@ def main():
                         print("➡️ 갭 중앙 도달. 우회전 진입 준비")
 
                 # =========================
-                # [4] 우회전으로 주차칸 진입 (상단 방향)
+                # [4] 우회전으로 주차칸 진입
                 # =========================
                 elif state == STATE_TURN_IN:
-                    cmd_servo = SERVO_RIGHT_MAX
                     dt = curr_time - state_timer
+                    cmd_servo = SERVO_RIGHT_MAX
 
                     if dt < STEER_WAIT_TIME:
                         cmd_speed = 0
@@ -281,40 +316,49 @@ def main():
                         msg = f"TURN IN RIGHT... {dt-STEER_WAIT_TIME:.1f}/{TIME_TURN_IN}s"
 
                         if (dt - STEER_WAIT_TIME) >= TIME_TURN_IN:
-                            # 바로 직진 주차로
                             state = STATE_STRAIGHT_IN
                             state_timer = curr_time
-                            print("⬆️ 진입 완료 -> 직진 주차 시작")
+                            print("⬆️ 진입 완료 -> 직진 주차 시작(센터링 활성)")
 
                 # =========================
-                # [5] 직진으로 주차 마무리
+                # [5] 직진 주차 마무리 (센터링 포함)
                 # =========================
                 elif state == STATE_STRAIGHT_IN:
-                    cmd_servo = SERVO_CENTER
                     dt = curr_time - state_timer
 
                     if dt < STEER_WAIT_TIME:
                         cmd_speed = 0
+                        cmd_servo = SERVO_CENTER
                         msg = "Align CENTER..."
                     else:
+                        # 기본 전진
                         cmd_speed = SPEED_PARKIN
-                        msg = f"PARK IN STRAIGHT | F={int(front_dist)}"
 
-                    # 전방 끝/벽 감지로 정지
+                        # (핵심) 좌/우 거리 균형 맞추기
+                        error = left_dist - right_dist  # (+)이면 왼쪽이 멀다 = 오른쪽이 가깝다(상대적으로)
+                        if abs(error) < CENTER_DEADBAND:
+                            delta = 0
+                        else:
+                            delta = int(clamp(CENTER_KP * error, -CENTER_SERVO_LIMIT, CENTER_SERVO_LIMIT))
+
+                        cmd_servo = SERVO_CENTER + delta
+                        msg = f"PARK IN | L={int(left_dist)} R={int(right_dist)} err={int(error)} dS={delta}"
+
+                    # 전방 끝/벽 감지로 정지 (앞 25cm 남기기 목표)
                     if front_dist < PARK_FRONT_STOP_DIST and dt > STEER_WAIT_TIME:
-                        print(f"✅ 전방 감지로 주차 완료! F={int(front_dist)}")
+                        print(f"✅ 전방 감지로 주차 완료! F={int(front_dist)}mm (target~{PARK_FRONT_STOP_DIST})")
                         ser.write(b"D,0\n")
                         state = STATE_PARKED
                         state_timer = curr_time
 
-                    # 안전 타임아웃
+                    # 안전 타임아웃 (전방이 열려있어도 멈춤 보장)
                     if dt > TIME_STRAIGHT_IN_MAX:
                         print("✅ 주차 완료(타임아웃)")
                         ser.write(b"D,0\n")
                         state = STATE_PARKED
                         state_timer = curr_time
 
-                    # 초음파 긴급(혹시 후방 센서가 앞을 보게 달린 경우 대비)
+                    # 초음파 긴급 정지(센서 배치가 다를 수 있어 “안전”으로만)
                     if dist_LT < REAR_URGENT or dist_RT < REAR_URGENT:
                         print("🧯 초음파 URGENT STOP!")
                         ser.write(b"D,0\n")
@@ -324,7 +368,7 @@ def main():
                 elif state == STATE_PARKED:
                     cmd_speed = 0
                     cmd_servo = SERVO_CENTER
-                    msg = "PARKED ✅ (q to quit)"
+                    msg = "PARKED ✅ (press q to quit)"
                     ser.write(b"D,0\n")
 
                 # ---- 명령 송신 ----
@@ -332,19 +376,28 @@ def main():
                 ser.write(f"D,{cmd_speed}\n".encode())
 
                 # ---- 디버그 UI ----
-                debug_img = np.zeros((320, 820, 3), dtype=np.uint8)
-                cv2.putText(debug_img, f"State: {state} | {msg}", (10, 50),
+                debug_img = np.zeros((360, 920, 3), dtype=np.uint8)
+                cv2.putText(debug_img, f"State: {state} | {msg}", (10, 45),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
-                cv2.putText(debug_img, f"Right(250~290): {int(right_dist)}mm  | Front(350~20): {int(front_dist)}mm",
-                            (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(debug_img, f"US(LT/RT): {dist_LT}/{dist_RT}", (10, 170),
+
+                cv2.putText(debug_img,
+                            f"R(250~290): {int(right_dist)}  L(70~110): {int(left_dist)}  F(350~20): {int(front_dist)}",
+                            (10, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                cv2.putText(debug_img, f"US(LT/RT): {dist_LT}/{dist_RT}", (10, 160),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(debug_img, "Press 'q' to quit", (10, 240),
+
+                cv2.putText(debug_img,
+                            f"Car(WxL): {CAR_W}x{CAR_L}  Slot(WxL): {SLOT_W}x{SLOT_L}  SideClearEach: {int(SIDE_CLEAR_EACH)}mm",
+                            (10, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 255), 2)
+
+                cv2.putText(debug_img, "Press 'q' to quit", (10, 300),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
                 cv2.imshow("Parking Monitor", debug_img)
+
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
+                if key == ord("q"):
                     running = False
                     break
 
@@ -362,19 +415,21 @@ def main():
             print(f"시스템 오류: {e}")
             break
 
-    # 종료
+    # 종료 처리
     try:
         if ser:
             ser.write(b"D,0\n")
             ser.close()
     except:
         pass
+
     try:
         if lidar:
             lidar.stop()
             lidar.disconnect()
     except:
         pass
+
     cv2.destroyAllWindows()
 
 
