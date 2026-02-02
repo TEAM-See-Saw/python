@@ -31,7 +31,7 @@ CENTERING_POWER = 30
 STEER_WAIT_TIME = 0.8
 
 # [시간 설정]
-TIME_SETUP_MOVE = 7.0
+TIME_SETUP_MOVE = 8.0
 TIME_REVERSE_TURN = 7.5
 TIME_EXIT_TURN = 16.0
 TIME_EXIT_ADJUST = 1.0
@@ -220,7 +220,7 @@ def main():
 
                         if (diff > JUMP_THRESHOLD and lidar_radar < MAX_VALID_DIST) or (lidar_radar < SAFETY_DIST_CAR2):
                             stable_count += 1
-                            if stable_count >= 1:
+                            if stable_count > 1: # 라이다로 값 2번 튀면 빈 공간으로 인식
                                 if lidar_radar < SAFETY_DIST_CAR2:
                                     print(f"🚨 2번 차 바로 앞 도착! (거리: {int(lidar_radar)}) -> 강제 정지")
                                 else:
