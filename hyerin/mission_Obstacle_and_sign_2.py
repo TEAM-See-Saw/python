@@ -16,9 +16,7 @@ BAUDRATE = 115200
 SERIAL_DELAY = 0.05
 SPEED_REFRESH_DELAY = 1.0
 
-# ✅ 카메라 인덱스: 단독 코드와 동일하게 "차선 카메라 = 1"
 CAM_INDEX = 1
-# 신호등 카메라(별도)
 CAM_INDEX_TRAFFIC = 0
 
 MAX_SPEED = 255
@@ -52,7 +50,7 @@ else:
     BLUR_K = 5
 
 # ==========================================
-# [추가] 미션/회피/정지선 관련 (라이다/횡단보도)
+# [추가] 라이다/장애물 회피
 # ==========================================
 LIDAR_PORT = 'COM3'
 
@@ -60,17 +58,30 @@ OBSTACLE_START_DIST = 1000   # mm
 SHIFT_GAIN = 1.2             # px per (mm 부족분)
 OBSTACLE_CLEAR_TIME = 1.5
 
+# ==========================================
+# [추가] 횡단보도/정지선
+# ==========================================
 CROSSWALK_RATIO_MIN = 0.12
 CROSSWALK_MAX_WAIT = 7.0
 CROSSWALK_COOLDOWN = 5.0
 CROSSWALK_CONFIRM_TIME = 0.2
 
 # ==========================================
-# [추가] 신호등(좌/우 밝기) 판정 파라미터
+# ✅ [핵심] 신호등 ROI(박스) 파라미터
+# - "신호등 3구 하우징"만 딱 잡히게 맞춰야 함
+# - 화면에서 박스가 배경(창/벽)을 포함하면 실패함
 # ==========================================
-TRAFFIC_Y_MAX_RATIO = 0.60
-TRAFFIC_BRIGHT_RATIO_TH = 0.015
-TRAFFIC_DOMINANCE_K = 1.25
+TRAFFIC_BOX_X1 = 0.22
+TRAFFIC_BOX_X2 = 0.62
+TRAFFIC_BOX_Y1 = 0.35
+TRAFFIC_BOX_Y2 = 0.62
+
+# ==========================================
+# ✅ [핵심] 신호등 인식 파라미터 (과노출 대응)
+# ==========================================
+TRAFFIC_HIGHLIGHT_PCTL = 98     # fallback 밝은 blob threshold percentile (96~99)
+TRAFFIC_TH_MIN = 200            # fallback 최소 threshold
+# HSV gate 튜닝은 함수 내부에서 S_GATE/V_GATE/COLOR_TH로 조정
 
 # ==========================================
 # [2] 시리얼/라이다/카메라 연결
@@ -203,41 +214,123 @@ def detect_stop_line(mask, frame_to_draw, roi_ratio=0.6):
     return detected
 
 
-def detect_traffic_lr(frame_bgr):
-    h, w = frame_bgr.shape[:2]
-    y2 = int(h * TRAFFIC_Y_MAX_RATIO)
-    roi = frame_bgr[0:y2, 0:w]
+# ==========================================
+# ✅ [핵심] 신호등 인식: HSV(색) 우선 + 과노출 fallback(밝은 blob 위치)
+# - LEFT  => 정지 신호 (빨강/왼쪽램프)
+# - RIGHT => 출발 신호 (초록/오른쪽램프)
+# ==========================================
+def detect_traffic_lr_robust(frame_bgr):
+    H, W = frame_bgr.shape[:2]
 
+    x1 = int(W * TRAFFIC_BOX_X1)
+    x2 = int(W * TRAFFIC_BOX_X2)
+    y1 = int(H * TRAFFIC_BOX_Y1)
+    y2 = int(H * TRAFFIC_BOX_Y2)
+
+    x1 = max(0, min(W - 2, x1))
+    x2 = max(x1 + 1, min(W - 1, x2))
+    y1 = max(0, min(H - 2, y1))
+    y2 = max(y1 + 1, min(H - 1, y2))
+
+    roi = frame_bgr[y1:y2, x1:x2]
+    rh, rw = roi.shape[:2]
+    if rh < 5 or rw < 5:
+        return "NONE", {"box": (x1, y1, x2, y2), "mode": "ROI_TOO_SMALL"}
+
+    third = max(1, rw // 3)
+
+    # ---- (1) HSV color detection with saturation gate ----
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    Hh, Ss, Vv = cv2.split(hsv)
+
+    S_GATE = 60     # 흰색(채도 낮음) 제거 강도. 60~90 튜닝
+    V_GATE = 80     # 어두운 노이즈 제거. 60~120 튜닝
+    COLOR_TH = 0.003  # 색 픽셀 비율 임계. 0.001~0.01 튜닝
+
+    sat_mask = (Ss >= S_GATE).astype(np.uint8) * 255
+
+    red1 = cv2.inRange(hsv, (0,   S_GATE, V_GATE), (10, 255, 255))
+    red2 = cv2.inRange(hsv, (170, S_GATE, V_GATE), (180, 255, 255))
+    red_mask = cv2.bitwise_or(red1, red2)
+
+    green_mask = cv2.inRange(hsv, (35, S_GATE, V_GATE), (85, 255, 255))
+
+    red_mask = cv2.bitwise_and(red_mask, sat_mask)
+    green_mask = cv2.bitwise_and(green_mask, sat_mask)
+
+    k = np.ones((3, 3), np.uint8)
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, k)
+    green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, k)
+
+    # LEFT lamp == ROI left third, RIGHT lamp == ROI right third
+    red_left = red_mask[:, 0:third]
+    green_right = green_mask[:, 2*third:rw] if (2*third) < rw else green_mask[:, third:rw]
+
+    red_left_ratio = cv2.countNonZero(red_left) / float(red_left.size)
+    green_right_ratio = cv2.countNonZero(green_right) / float(green_right.size)
+
+    if red_left_ratio > COLOR_TH and green_right_ratio < COLOR_TH:
+        return "LEFT", {
+            "box": (x1, y1, x2, y2),
+            "mode": "HSV_COLOR",
+            "red_left": red_left_ratio,
+            "green_right": green_right_ratio
+        }
+    if green_right_ratio > COLOR_TH and red_left_ratio < COLOR_TH:
+        return "RIGHT", {
+            "box": (x1, y1, x2, y2),
+            "mode": "HSV_COLOR",
+            "red_left": red_left_ratio,
+            "green_right": green_right_ratio
+        }
+
+    # ---- (2) Fallback: brightest blob position ----
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    p = np.percentile(gray, TRAFFIC_HIGHLIGHT_PCTL)
+    thr = int(max(TRAFFIC_TH_MIN, p))
+    _, th = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY)
+    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
-    third = w // 3
-    left = th[:, 0:third]
-    right = th[:, 2 * third:w]
+    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours) == 0:
+        return "NONE", {"box": (x1, y1, x2, y2), "mode": "FALLBACK_NONE", "thr": thr,
+                        "red_left": red_left_ratio, "green_right": green_right_ratio}
 
-    left_ratio = cv2.countNonZero(left) / float(left.size)
-    right_ratio = cv2.countNonZero(right) / float(right.size)
+    c = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(c)
+    if area < 30:
+        return "NONE", {"box": (x1, y1, x2, y2), "mode": "FALLBACK_SMALL", "thr": thr, "area": area,
+                        "red_left": red_left_ratio, "green_right": green_right_ratio}
 
-    left_on = left_ratio > TRAFFIC_BRIGHT_RATIO_TH
-    right_on = right_ratio > TRAFFIC_BRIGHT_RATIO_TH
+    M = cv2.moments(c)
+    if M["m00"] == 0:
+        return "NONE", {"box": (x1, y1, x2, y2), "mode": "FALLBACK_BADMOM", "thr": thr,
+                        "red_left": red_left_ratio, "green_right": green_right_ratio}
 
-    if left_on and (left_ratio > right_ratio * TRAFFIC_DOMINANCE_K):
-        return "LEFT", left_ratio, right_ratio
-    if right_on and (right_ratio > left_ratio * TRAFFIC_DOMINANCE_K):
-        return "RIGHT", left_ratio, right_ratio
+    cx = int(M["m10"] / M["m00"])  # ROI 내부 x
 
-    if left_on and not right_on:
-        return "LEFT", left_ratio, right_ratio
-    if right_on and not left_on:
-        return "RIGHT", left_ratio, right_ratio
+    if cx < third:
+        state = "LEFT"
+    elif cx > 2 * third:
+        state = "RIGHT"
+    else:
+        state = "NONE"
 
-    return "NONE", left_ratio, right_ratio
+    return state, {
+        "box": (x1, y1, x2, y2),
+        "mode": "BRIGHT_BLOB",
+        "thr": thr,
+        "cx": cx,
+        "area": area,
+        "red_left": red_left_ratio,
+        "green_right": green_right_ratio
+    }
 
 
 # ==========================================
-# ✅ [추가] 현서 코드의 "장애물 회피 조향" 함수 그대로 이식
+# ✅ [추가] 장애물 회피 조향 함수 (현서 코드 방식)
 # ==========================================
 def calculate_avoid_angle(image, left_line, right_line, obstacle_dist, last_angle, direction):
     height, width = image.shape[:2]
@@ -251,7 +344,6 @@ def calculate_avoid_angle(image, left_line, right_line, obstacle_dist, last_angl
     elif right_line is not None:
         base_target = right_line[0][2] - (width * 0.25)
     else:
-        # 라인이 안 보이면 마지막 각도 유지
         return last_angle, int(car_x + (last_angle * 5)), 0
 
     final_target = base_target
@@ -271,14 +363,13 @@ def calculate_avoid_angle(image, left_line, right_line, obstacle_dist, last_angl
 
 
 # ==========================================
-# [4] 메인 루프
+# [4] 메인 루프 변수
 # ==========================================
 is_crosswalk_stop = False
 crosswalk_start_time = 0.0
 crosswalk_cooldown_timer = 0.0
 crosswalk_detect_timer = 0.0
 
-# ✅ 현서 코드 방식 그대로
 obstacle_count = 0
 is_obstacle_detected = False
 obs_clear_finished_time = 0.0
@@ -287,7 +378,6 @@ obstacle_last_seen_time = 0.0
 last_serial_time = 0.0
 last_speed_time = 0.0
 
-# ✅ avoid_angle에서 last_angle 유지용
 last_valid_angle = 0.0
 
 try:
@@ -338,8 +428,8 @@ try:
 
         h, w = frame_lane.shape[:2]
 
-        # (3) Cam0 신호등: 좌/우 밝기 판정
-        traffic_state, lratio, rratio = detect_traffic_lr(frame_traffic)
+        # (3) 신호등 판정 (개선 버전)
+        traffic_state, tdbg = detect_traffic_lr_robust(frame_traffic)
 
         # (4) 차선 마스크
         blurred = cv2.medianBlur(frame_lane, BLUR_K)
@@ -350,6 +440,7 @@ try:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones(MORPH_SIZE, np.uint8))
         mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
+        # ROI
         roi_points = np.array([[
             (0, h), (w, h),
             (int(w * ROI_X_RIGHT_RATIO), int(h * ROI_HEIGHT_RATIO)),
@@ -379,15 +470,13 @@ try:
         left, right = average_slope_intercept(frame_lane, lines)
 
         # ==========================================================
-        # ✅ (6) 장애물 회피 로직: "현서 코드"만 그대로 반영 (핵심)
+        # (6) 장애물 회피 로직 (현서 코드)
         # ==========================================================
         status_msg = "NORMAL"
         status_color = (0, 255, 0)
         final_speed = MAX_SPEED
-
         avoid_direction = 0
 
-        # (A) 장애물 감지
         if raw_dist < OBSTACLE_START_DIST:
             obstacle_last_seen_time = current_time
 
@@ -409,7 +498,6 @@ try:
                 status_msg = f"OBSTACLE #{obstacle_count}"
                 final_speed = min(final_speed, 120)
 
-        # (B) 장애물 없음(복귀)
         else:
             if is_obstacle_detected:
                 if current_time - obstacle_last_seen_time < OBSTACLE_CLEAR_TIME:
@@ -427,12 +515,10 @@ try:
             else:
                 avoid_direction = 0
 
-        # eff_dist 보정 (현서 코드)
         eff_dist = raw_dist
         if avoid_direction != 0 and raw_dist > OBSTACLE_START_DIST:
             eff_dist = OBSTACLE_START_DIST / 2
 
-        # ✅ 최종 조향: calculate_avoid_angle 사용
         angle, target, shift_px = calculate_avoid_angle(
             frame_lane, left, right, eff_dist, last_valid_angle, avoid_direction
         )
@@ -441,7 +527,9 @@ try:
         servo_val = int(map_value(max(-45, min(45, angle)), -45, 45, SERVO_LEFT_MAX, SERVO_RIGHT_MAX))
 
         # ==========================================================
-        # (7) 정지선/신호등 로직 (기존 그대로)
+        # (7) 정지선 + 신호등(좌/우) 로직
+        # - 정지선 + LEFT(왼쪽 램프) => 정지
+        # - 정지 중 RIGHT(오른쪽 램프) => 출발
         # ==========================================================
         if is_crosswalk_stop:
             final_speed = 0
@@ -490,14 +578,11 @@ try:
             else:
                 crosswalk_detect_timer = 0
 
-        # 장애물 가까우면 감속(정지 중 아닐 때)
+        # 추가 감속 (정지 중 아닐 때)
         if raw_dist < 800 and not is_crosswalk_stop:
             final_speed = min(final_speed, 120)
-            # status_msg는 이미 avoid 쪽에서 세팅될 수 있으니 덮어쓰지 않음(원하면 아래 주석 해제)
-            # status_msg = f"OBSTACLE {raw_dist:.0f}mm"
-            # status_color = (0, 255, 255)
 
-        # (8) 통신
+        # (8) 통신 (Heartbeat)
         if ser:
             if current_time - last_serial_time > SERIAL_DELAY:
                 ser.write(f"S,{servo_val}\n".encode())
@@ -508,20 +593,32 @@ try:
                 last_speed_time = current_time
 
         # (9) 디스플레이
-        cv2.putText(frame_traffic, f"Traffic: {traffic_state}  L:{lratio:.3f} R:{rratio:.3f}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+        # ---- traffic debug ----
+        box = tdbg.get("box", None)
+        mode = tdbg.get("mode", "-")
+        if box is not None:
+            x1, y1, x2, y2 = box
+            cv2.rectangle(frame_traffic, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
-        th = width // 3
-        y2 = int(height * TRAFFIC_Y_MAX_RATIO)
-        cv2.rectangle(frame_traffic, (0, 0), (th, y2), (255, 255, 0), 2)
-        cv2.rectangle(frame_traffic, (2 * th, 0), (width - 1, y2), (255, 255, 0), 2)
+            # ROI 내부 3분할 가이드
+            rw = x2 - x1
+            third = max(1, rw // 3)
+            cv2.line(frame_traffic, (x1 + third, y1), (x1 + third, y2), (255, 255, 0), 2)
+            cv2.line(frame_traffic, (x1 + 2*third, y1), (x1 + 2*third, y2), (255, 255, 0), 2)
 
+        rl = tdbg.get("red_left", 0.0)
+        gr = tdbg.get("green_right", 0.0)
+        cv2.putText(frame_traffic,
+                    f"Traffic:{traffic_state} mode:{mode}  redL:{rl:.3f} greenR:{gr:.3f}",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
+
+        # ---- lane debug ----
         cv2.polylines(mask_bgr, [roi_points], True, (0, 255, 255), 2)
         cv2.circle(mask_bgr, (target, int(h * ROI_HEIGHT_RATIO)), 10, (0, 0, 255), -1)
 
-        cv2.putText(mask_bgr, f"L-Min: {current_l_min} | Ratio: {ratio * 100:.1f}%", (20, 40),
+        cv2.putText(mask_bgr, f"L-Min:{current_l_min} | Ratio:{ratio*100:.1f}%", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(mask_bgr, f"Angle:{angle:.1f}  Target:{target}  Shift:{shift_px:.0f}", (20, 70),
+        cv2.putText(mask_bgr, f"Angle:{angle:.1f} Target:{target} Shift:{shift_px:.0f}", (20, 70),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
         cv2.putText(mask_bgr, status_msg, (20, 110),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, status_color, 2)
