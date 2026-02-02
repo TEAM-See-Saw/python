@@ -4,10 +4,10 @@ import math
 import serial
 import time
 from rplidar import RPLidar
-from Function_Library import libCAMERA
+from Function_Library import libCAMERA  # (사용 안 해도 됨, 기존 코드 유지)
 
 # ==========================================
-# [1] 환경 및 튜닝 설정  (✅ 위 단독 코드와 동일)
+# [1] 환경 및 튜닝 설정  (✅ 단독 라인트레이싱 코드와 동일)
 # ==========================================
 IS_SUNNY = True
 
@@ -16,9 +16,9 @@ BAUDRATE = 115200
 SERIAL_DELAY = 0.05
 SPEED_REFRESH_DELAY = 1.0
 
-# ✅ 카메라 인덱스: 위 코드와 동일하게 "차선 카메라 = 1"
+# ✅ 카메라 인덱스: 단독 코드와 동일하게 "차선 카메라 = 1"
 CAM_INDEX = 1
-# 추가로 신호등 카메라만 별도 사용
+# 신호등 카메라(별도)
 CAM_INDEX_TRAFFIC = 0
 
 MAX_SPEED = 255
@@ -52,12 +52,12 @@ else:
     BLUR_K = 5
 
 # ==========================================
-# [추가] 미션/회피/정지선 관련 (라이다/신호등/횡단보도)
+# [추가] 미션/회피/정지선 관련 (라이다/횡단보도)
 # ==========================================
 LIDAR_PORT = 'COM3'
 
 OBSTACLE_START_DIST = 1000   # mm
-SHIFT_GAIN = 1.2             # px per (mm 부족분) 스케일
+SHIFT_GAIN = 1.2             # px per (mm 부족분)
 OBSTACLE_CLEAR_TIME = 1.5
 
 CROSSWALK_RATIO_MIN = 0.12
@@ -66,11 +66,17 @@ CROSSWALK_COOLDOWN = 5.0
 CROSSWALK_CONFIRM_TIME = 0.2
 
 # ==========================================
+# [추가] 신호등(좌/우 밝기) 판정 파라미터
+# ==========================================
+TRAFFIC_Y_MAX_RATIO = 0.60          # 신호등이 상단에 있으니 상단 60%만 검사
+TRAFFIC_BRIGHT_RATIO_TH = 0.015     # "하얀 빛" 픽셀 비율 임계값 (0.01~0.05 튜닝)
+TRAFFIC_DOMINANCE_K = 1.25          # 좌/우 둘 다 밝게 잡힐 때 우세한 쪽만 선택
+
+# ==========================================
 # [2] 시리얼/라이다/카메라 연결
 # ==========================================
 ser = None
 lidar = None
-camera_lib = None
 cap_lane = None
 cap_traffic = None
 
@@ -80,14 +86,15 @@ try:
     time.sleep(2)
 except Exception as e:
     print(f"❌ 시리얼 연결 실패: {e}")
+    ser = None
 
 try:
     lidar = RPLidar(LIDAR_PORT)
-    camera_lib = libCAMERA()
 except Exception as e:
-    print(f"❌ 라이다/카메라라이브러리 초기화 실패: {e}")
+    print(f"❌ 라이다 초기화 실패: {e}")
+    lidar = None
 
-# ✅ 위 코드와 "완전 동일"한 카메라 오픈/세팅
+# ✅ 단독 코드와 동일한 방식으로 카메라 오픈/세팅
 cap_lane = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
 cap_traffic = cv2.VideoCapture(CAM_INDEX_TRAFFIC, cv2.CAP_DSHOW)
 
@@ -103,12 +110,12 @@ cap_traffic.set(4, height)
 cap_traffic.set(15, -6)
 
 if not cap_lane.isOpened():
-    print("❌ 차선 카메라 오류")
+    print("❌ 차선 카메라 오류 (CAM_INDEX 확인)")
 if not cap_traffic.isOpened():
-    print("❌ 신호등 카메라 오류")
+    print("❌ 신호등 카메라 오류 (CAM_INDEX_TRAFFIC 확인)")
 
 # ==========================================
-# [3] 영상 처리 함수들 (✅ 위 단독 코드 그대로)
+# [3] 영상 처리 함수들 (✅ 단독 코드 그대로)
 # ==========================================
 def region_of_interest(img, vertices):
     mask = np.zeros_like(img)
@@ -136,7 +143,6 @@ def average_slope_intercept(image, lines):
         return None, None
     for line in lines:
         for x1, y1, x2, y2 in line:
-            # 수직선 방지
             if x1 == x2:
                 continue
             fit = np.polyfit((x1, x2), (y1, y2), 1)
@@ -202,6 +208,48 @@ def detect_stop_line(mask, frame_to_draw, roi_ratio=0.6):
 
 
 # ==========================================
+# [추가] Cam0 신호등 "좌/우 밝기(하얀 빛)" 판정
+# - 왼쪽이 밝으면 "LEFT"  (정지 신호)
+# - 오른쪽이 밝으면 "RIGHT" (출발 신호)
+# - 애매하면 "NONE"
+# ==========================================
+def detect_traffic_lr(frame_bgr):
+    h, w = frame_bgr.shape[:2]
+    y2 = int(h * TRAFFIC_Y_MAX_RATIO)
+    roi = frame_bgr[0:y2, 0:w]
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Otsu로 밝은 영역 자동 분리
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    third = w // 3
+    left = th[:, 0:third]
+    right = th[:, 2 * third:w]
+
+    left_ratio = cv2.countNonZero(left) / float(left.size)
+    right_ratio = cv2.countNonZero(right) / float(right.size)
+
+    left_on = left_ratio > TRAFFIC_BRIGHT_RATIO_TH
+    right_on = right_ratio > TRAFFIC_BRIGHT_RATIO_TH
+
+    # 둘 다 켜져 보이면 우세한 쪽만
+    if left_on and (left_ratio > right_ratio * TRAFFIC_DOMINANCE_K):
+        return "LEFT", left_ratio, right_ratio
+    if right_on and (right_ratio > left_ratio * TRAFFIC_DOMINANCE_K):
+        return "RIGHT", left_ratio, right_ratio
+
+    # 한쪽만 충분히 크면 인정
+    if left_on and not right_on:
+        return "LEFT", left_ratio, right_ratio
+    if right_on and not left_on:
+        return "RIGHT", left_ratio, right_ratio
+
+    return "NONE", left_ratio, right_ratio
+
+
+# ==========================================
 # [4] 메인 루프
 # ==========================================
 is_crosswalk_stop = False
@@ -222,17 +270,18 @@ try:
     for i in range(3, 0, -1):
         print(f"{i}..")
         time.sleep(1)
+
     if ser:
         ser.write(f"D,{MAX_SPEED}\n".encode())
 
     print("🚀 주행 시작")
 
-    # 라이다가 없으면 카메라만 돌리도록(디버깅 편의)
+    # 라이다 없으면 카메라만 계속(디버깅)
     scan_iter = lidar.iter_scans() if lidar is not None else [None] * 10**9
 
     for scan in scan_iter:
         # -----------------------------
-        # (0) 아두이노 버퍼 비우기 (위 코드와 동일)
+        # (0) 아두이노 버퍼 비우기 (단독 코드와 동일)
         # -----------------------------
         if ser:
             try:
@@ -272,14 +321,12 @@ try:
         h, w = frame_lane.shape[:2]
 
         # -----------------------------
-        # (3) 신호등
+        # (3) Cam0 신호등: 좌/우 밝기 판정
         # -----------------------------
-        traffic_light = "UNKNOWN"
-        if camera_lib is not None:
-            traffic_light = camera_lib.object_detection(frame_traffic, sample=3, print_enable=False)
+        traffic_state, lratio, rratio = detect_traffic_lr(frame_traffic)
 
         # -----------------------------
-        # (4) 차선 마스크 (✅ 위 코드 그대로)
+        # (4) 차선 마스크 (단독 코드 그대로)
         # -----------------------------
         blurred = cv2.medianBlur(frame_lane, BLUR_K)
         hls = cv2.cvtColor(blurred, cv2.COLOR_BGR2HLS)
@@ -306,14 +353,14 @@ try:
             total_area = 1
         ratio = white_count / total_area
 
-        # Auto Tuning (✅ 위 코드 그대로)
+        # Auto Tuning (단독 코드 그대로)
         if ratio > TARGET_RATIO_MAX:
             current_l_min = min(current_l_min + 2, MAX_L_VAL)
         elif ratio < TARGET_RATIO_MIN:
             current_l_min = max(current_l_min - 2, MIN_L_VAL)
 
         # -----------------------------
-        # (5) 라인 트레이싱 (✅ 위 코드 그대로)
+        # (5) 라인 트레이싱 (단독 코드 그대로)
         # -----------------------------
         edges = cv2.Canny(mask, 50, 150)
         cropped = region_of_interest(edges, roi_points)
@@ -323,7 +370,7 @@ try:
         base_angle, base_target = calculate_steering_angle(frame_lane, left, right)
 
         # -----------------------------
-        # (6) 장애물 회피: "타겟 x"에 shift를 더/빼서 복귀되게 구성
+        # (6) 장애물 회피: 타겟 x에 shift 적용
         # -----------------------------
         avoid_direction = 0
         if raw_dist < OBSTACLE_START_DIST:
@@ -333,7 +380,6 @@ try:
                 is_obstacle_detected = True
                 print(f"⚠️ 장애물 #{obstacle_count} 감지!")
 
-            # 1번은 좌, 2번은 우
             if obstacle_count == 1:
                 avoid_direction = -1
             elif obstacle_count == 2:
@@ -354,7 +400,6 @@ try:
                     avoid_direction = 0
                     print("✅ 복귀")
 
-        # 회피 shift 적용(타겟 기반)
         target_x = float(base_target)
         shift_px = 0.0
         if avoid_direction != 0:
@@ -362,7 +407,7 @@ try:
             shift_px = (OBSTACLE_START_DIST - calc_dist) * SHIFT_GAIN
             target_x = target_x + (avoid_direction * shift_px)
 
-        # 타겟 기반으로 다시 각도 계산(라인 트레이싱 수식 동일)
+        # 다시 각도 계산
         car_x = w / 2.0
         target_y = int(h * ROI_HEIGHT_RATIO)
         dx = target_x - car_x
@@ -370,11 +415,12 @@ try:
         angle = math.degrees(math.atan2(dx, abs(dy)))
         target = int(max(0, min(w - 1, target_x)))
 
-        # 서보 매핑(✅ 위 코드 그대로)
         servo_val = int(map_value(max(-45, min(45, angle)), -45, 45, SERVO_LEFT_MAX, SERVO_RIGHT_MAX))
 
         # -----------------------------
-        # (7) 정지선/신호등 로직 (원래 코드 유지)
+        # (7) 정지선/신호등 로직 (✅ 요청사항 반영)
+        # - 정지선 + LEFT(왼쪽 빛) => 정지
+        # - 정지 중 RIGHT(오른쪽 빛) => 출발
         # -----------------------------
         final_speed = MAX_SPEED
         status_msg = "NORMAL"
@@ -383,55 +429,64 @@ try:
         if is_crosswalk_stop:
             final_speed = 0
             elapsed = current_time - crosswalk_start_time
-            if traffic_light == "GREEN":
+
+            # ✅ 오른쪽 빛 ON이면 출발
+            if traffic_state == "RIGHT":
                 is_crosswalk_stop = False
                 crosswalk_cooldown_timer = current_time
                 crosswalk_detect_timer = 0
-                status_msg = "GO (GREEN)"
+                status_msg = "GO (RIGHT ON)"
                 status_color = (0, 255, 0)
+
             elif elapsed > CROSSWALK_MAX_WAIT:
                 is_crosswalk_stop = False
                 crosswalk_cooldown_timer = current_time
                 crosswalk_detect_timer = 0
                 status_msg = "GO (TIMEOUT)"
                 status_color = (0, 255, 0)
+
             else:
-                status_msg = f"WAIT GREEN.. ({elapsed:.1f}s)"
+                status_msg = f"WAIT RIGHT.. ({elapsed:.1f}s)"
                 status_color = (0, 0, 255)
+
         else:
             # 정지선 감지(ROI 조건)
             if (ratio > CROSSWALK_RATIO_MIN) and (current_time - crosswalk_cooldown_timer > CROSSWALK_COOLDOWN):
                 if detect_stop_line(mask, mask_bgr, ROI_HEIGHT_RATIO):
-                    if traffic_light == "RED":
+
+                    # ✅ 정지선 + 왼쪽 빛 ON이면 정지 진입
+                    if traffic_state == "LEFT":
                         if crosswalk_detect_timer == 0:
                             crosswalk_detect_timer = current_time
                         elif current_time - crosswalk_detect_timer > CROSSWALK_CONFIRM_TIME:
                             is_crosswalk_stop = True
                             crosswalk_start_time = current_time
                             final_speed = 0
-                            status_msg = "STOP! (Line+RED)"
+                            status_msg = "STOP! (Line+LEFT ON)"
                             status_color = (0, 0, 255)
                             crosswalk_detect_timer = 0
                         else:
-                            status_msg = "Checking Line+RED..."
+                            status_msg = "Checking Line+LEFT..."
                             status_color = (0, 255, 255)
+
                     else:
+                        # 정지선은 있는데 왼쪽 빛이 아니면 정지하지 않음
                         crosswalk_detect_timer = 0
-                        status_msg = f"Line Detected ({traffic_light})"
+                        status_msg = f"Line Detected ({traffic_state})"
                         status_color = (0, 255, 255)
                 else:
                     crosswalk_detect_timer = 0
             else:
                 crosswalk_detect_timer = 0
 
-        # 장애물 가까우면 감속(원래 너 코드 스타일 유지)
+        # 장애물 가까우면 감속(정지 중 아닐 때)
         if raw_dist < 800 and not is_crosswalk_stop:
-            final_speed = min(final_speed, 120)  # 필요하면 값 조정
+            final_speed = min(final_speed, 120)  # 필요시 튜닝
             status_msg = f"OBSTACLE {raw_dist:.0f}mm"
             status_color = (0, 255, 255)
 
         # -----------------------------
-        # (8) 통신 (✅ 위 코드 Heartbeat 스타일)
+        # (8) 통신 (단독 코드 Heartbeat 스타일)
         # -----------------------------
         if ser:
             if current_time - last_serial_time > SERIAL_DELAY:
@@ -443,11 +498,17 @@ try:
                 last_speed_time = current_time
 
         # -----------------------------
-        # (9) 디스플레이 (위 코드 스타일 + 듀얼)
+        # (9) 디스플레이 (듀얼)
         # -----------------------------
         # traffic overlay
-        cv2.putText(frame_traffic, f"Light: {traffic_light}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+        cv2.putText(frame_traffic, f"Traffic: {traffic_state}  L:{lratio:.3f} R:{rratio:.3f}", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+
+        # (디버깅용) 좌/우 검사 영역 표시
+        th = width // 3
+        y2 = int(height * TRAFFIC_Y_MAX_RATIO)
+        cv2.rectangle(frame_traffic, (0, 0), (th, y2), (255, 255, 0), 2)           # left box
+        cv2.rectangle(frame_traffic, (2*th, 0), (width-1, y2), (255, 255, 0), 2)  # right box
 
         # mask overlay
         cv2.polylines(mask_bgr, [roi_points], True, (0, 255, 255), 2)
@@ -465,6 +526,9 @@ try:
 
         if cv2.waitKey(1) == ord('q'):
             break
+
+except KeyboardInterrupt:
+    print("사용자 종료")
 
 except Exception as e:
     print(f"❌ 오류 발생: {e}")
