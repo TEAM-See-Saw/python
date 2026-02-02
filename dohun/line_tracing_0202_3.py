@@ -87,7 +87,6 @@ def average_slope_intercept(image, lines):
 
             # ★ [수정됨] 횡단보도 회피 로직
             # 기울기 절댓값이 0.7 미만(누워있는 선)은 무시합니다.
-            # 횡단보도(가로선)는 기울기가 0에 가깝기 때문에 여기서 걸러집니다.
             if abs(slope) < 0.7:
                 continue
 
@@ -152,6 +151,13 @@ def main():
 
     try:
         while True:
+            # ========================================================
+            # [추가됨] 시리얼 입력 버퍼 비우기 (fflush 효과)
+            # 이전 프레임 처리 중에 쌓인 낡은 데이터를 삭제하여 반응성을 높임
+            # ========================================================
+            if ser:
+                ser.reset_input_buffer()
+
             ret, frame = cap.read()
             if not ret: break
             if frame.shape[1] != width: frame = cv2.resize(frame, (width, height))
@@ -200,7 +206,6 @@ def main():
             cropped = region_of_interest(edges, roi_points)
             lines = cv2.HoughLinesP(cropped, 1, np.pi / 180, 50, minLineLength=40, maxLineGap=100)
             
-            # 여기서 수정된 함수가 호출됨 (횡단보도 무시)
             left, right = average_slope_intercept(frame, lines)
             
             angle, target = calculate_steering_angle(frame, left, right)
