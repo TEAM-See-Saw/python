@@ -8,11 +8,11 @@ import time
 # [1] 환경 및 튜닝 설정 (실내/일반 모드 고정)
 # ==========================================
 PORT = 'COM4'
-BAUDRATE = 9600
+BAUDRATE = 115200
 SERIAL_DELAY = 0.05
 SPEED_REFRESH_DELAY = 1.0
 
-CAM_INDEX = 0
+CAM_INDEX = 1
 MAX_SPEED = 255
 SERVO_CENTER = 570
 SERVO_LEFT_MAX = 680

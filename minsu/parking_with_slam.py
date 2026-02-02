@@ -5,7 +5,7 @@ import numpy as np
 import cv2
 
 # ==========================================
-# [1] 설정값
+# [1] 설정값 (튜닝됨)
 # ==========================================
 PORT = 'COM4'
 LIDAR_PORT = 'COM3'
@@ -14,7 +14,7 @@ BAUDRATE = 115200
 SERIAL_DELAY = 0.05
 
 # 속도 설정
-SPEED_SEARCH = 70
+SPEED_SEARCH = 60
 SPEED_SETUP = 80
 SPEED_PARK = 75
 SPEED_STOP = 0
@@ -25,22 +25,22 @@ SERVO_RIGHT_MAX = 440
 SERVO_LEFT_MAX = 680
 SERVO_SLIGHT_RIGHT = 555
 
-# ★ 센터링 보정 강도 (너무 크면 휘청거림)
+# 센터링 보정 강도
 CENTERING_POWER = 30
 
 STEER_WAIT_TIME = 0.8
 
 # [시간 설정]
 TIME_SETUP_MOVE = 7.0
-TIME_REVERSE_PRE = 1.0
-TIME_REVERSE_TURN = 6.0
-TIME_EXIT_TURN = 13.0
+TIME_REVERSE_TURN = 7.5
+TIME_EXIT_TURN = 16.0
 TIME_EXIT_ADJUST = 1.0
 TIME_DELAY_STOP = 0.5
 
 # [센서 기준값]
-JUMP_THRESHOLD = 250
+JUMP_THRESHOLD = 30  # 3cm(30mm)만 차이나도 빈 공간으로 인식
 MAX_VALID_DIST = 4000
+SAFETY_DIST_CAR2 = 1200  # 이 거리 안으로 들어오면 2번차로 간주하고 강제 정지
 
 SIDE_STOP_DIST = 700
 REAR_LIMIT = 200
@@ -50,7 +50,6 @@ IDX_RT = 5
 # 상태 정의
 STATE_SEARCH = 0
 STATE_SETUP_LEFT = 1
-STATE_REVERSE_PRE_MOVE = 100
 STATE_REVERSE_TURN = 2
 STATE_REVERSE_STRAIGHT = 3
 STATE_DONE = 4
@@ -70,9 +69,8 @@ STEP_FIND_CAR2 = 3
 STATE_NAMES = {
     STATE_SEARCH: "SEARCHING",
     STATE_SETUP_LEFT: "SETUP MOVE (LEFT)",
-    STATE_REVERSE_PRE_MOVE: "REVERSE (STRAIGHT 1s)",
-    STATE_REVERSE_TURN: "REVERSE TURN",
-    STATE_REVERSE_STRAIGHT: "REVERSE PARKING (CENTERING)",  # 이름 변경
+    STATE_REVERSE_TURN: "REVERSE TURN (PARKING)",
+    STATE_REVERSE_STRAIGHT: "REVERSE PARKING (CENTERING)",
     STATE_PAUSE: "PAUSED",
     STATE_WAIT_AFTER_PARK: "PARKED & JUDGING",
     STATE_EXIT_TURN: "EXITING (TURN)",
@@ -159,8 +157,7 @@ def main():
     while True:
         try:
             for scan in lidar.iter_scans():
-                # 1. 센서 읽기 (Flush)
-                read_sensors()
+                read_sensors()  # Flush
 
                 lidar_radar = get_lidar_min_dist(scan, 30, 110)
                 dist_90 = get_dist_at_angle(scan, 90, 10)
@@ -176,7 +173,7 @@ def main():
                 log_text = ""
 
                 # ---------------------------------------------------
-                # [PAUSE] 일시 정지
+                # [PAUSE]
                 # ---------------------------------------------------
                 if state == STATE_PAUSE:
                     cmd_speed = 0
@@ -198,6 +195,7 @@ def main():
                     if search_step != STEP_FIND_CAR1:
                         diff = lidar_radar - reference_dist if search_step == STEP_PASS_CAR1 else reference_dist - lidar_radar
 
+                    # Step 1: 1번 차 찾기
                     if search_step == STEP_FIND_CAR1:
                         msg = "STEP 1: FIND CAR 1"
                         log_text = f"[탐색] 1번차 찾는중.. 거리:{int(lidar_radar)}"
@@ -213,15 +211,21 @@ def main():
                         else:
                             stable_count = 0
 
+                    # Step 2: 1번 차 통과 -> 빈 공간 찾기
                     elif search_step == STEP_PASS_CAR1:
-                        msg = "STEP 2: PASS CAR 1 -> FIND GAP"
+                        msg = "STEP 2: FIND GAP / CAR 2"
+                        diff = lidar_radar - reference_dist
                         log_text = f"[탐색] 1번차 통과중.. 현재:{int(lidar_radar)} 기준:{int(reference_dist)} 차이:{int(diff)}"
                         cmd_servo = SERVO_SLIGHT_RIGHT
 
-                        if diff > JUMP_THRESHOLD and lidar_radar < MAX_VALID_DIST:
+                        if (diff > JUMP_THRESHOLD and lidar_radar < MAX_VALID_DIST) or (lidar_radar < SAFETY_DIST_CAR2):
                             stable_count += 1
-                            if stable_count > 2:
-                                print(f"👀 빈 공간 발견! (차이: {int(diff)}) -> 2초 정지")
+                            if stable_count >= 1:
+                                if lidar_radar < SAFETY_DIST_CAR2:
+                                    print(f"🚨 2번 차 바로 앞 도착! (거리: {int(lidar_radar)}) -> 강제 정지")
+                                else:
+                                    print(f"👀 빈 공간 발견! (차이: {int(diff)}) -> 2초 정지")
+
                                 reference_dist = lidar_radar
                                 search_step = STEP_FIND_GAP
 
@@ -230,37 +234,27 @@ def main():
                                 next_state_after_pause = STATE_SEARCH
                                 pause_duration = 2.0
                                 pause_start_time = curr_time
-                                pause_msg = "GAP FOUND"
+                                pause_msg = "GAP/CAR2 FOUND"
                                 stable_count = 0
                         else:
-                            if lidar_radar < reference_dist + 200:
-                                reference_dist = (reference_dist * 0.8) + (lidar_radar * 0.2)
+                            if lidar_radar < reference_dist:
+                                reference_dist = (reference_dist * 0.7) + (lidar_radar * 0.3)
                             stable_count = 0
 
+                    # Step 3: 2번 차 찾기 (정지 시 역회전 삭제)
                     elif search_step == STEP_FIND_GAP:
-                        msg = "STEP 3: FIND CAR 2"
-                        diff = reference_dist - lidar_radar
-                        log_text = f"[탐색] 2번차 감지중.. 현재:{int(lidar_radar)} 기준:{int(reference_dist)} 차이:{int(diff)}"
-                        cmd_servo = SERVO_SLIGHT_RIGHT
+                        msg = "STEP 3: CONFIRM CAR 2"
+                        print("🛑 2번 차 확인 완료")
 
-                        if diff > JUMP_THRESHOLD or (0 < lidar_radar < 1000):
-                            stable_count += 1
-                            if stable_count > 2:
-                                print(f"🛑 2번 차 확실히 감지! (거리:{int(lidar_radar)}, 차이:{int(diff)})")
-                                ser.write(b"D,-150\n");
-                                time.sleep(0.1)
-                                ser.write(b"D,0\n")
+                        # ★ [수정] 역회전(-150) 삭제 -> 그냥 정지(0)
+                        ser.write(b"D,0\n")
 
-                                state = STATE_PAUSE
-                                next_state_after_pause = STATE_SETUP_LEFT
-                                pause_duration = 1.0
-                                pause_start_time = curr_time
-                                pause_msg = "DETECT CAR 2"
-                                stable_count = 0
-                        else:
-                            if lidar_radar > reference_dist:
-                                reference_dist = lidar_radar
-                            stable_count = 0
+                        state = STATE_PAUSE
+                        next_state_after_pause = STATE_SETUP_LEFT
+                        pause_duration = 1.0
+                        pause_start_time = curr_time
+                        pause_msg = "DETECT CAR 2"
+                        stable_count = 0
 
                 # ---------------------------------------------------
                 # [2] 공간 확보
@@ -279,31 +273,13 @@ def main():
                             print("🛑 공간 확보 완료")
                             ser.write(b"D,0\n")
                             state = STATE_PAUSE
-                            next_state_after_pause = STATE_REVERSE_PRE_MOVE
+                            next_state_after_pause = STATE_REVERSE_TURN
                             pause_duration = 1.0
                             pause_start_time = curr_time
                             pause_msg = "READY TO REVERSE"
 
                 # ---------------------------------------------------
-                # [★] 후진 진입 전 1초 직진
-                # ---------------------------------------------------
-                elif state == STATE_REVERSE_PRE_MOVE:
-                    cmd_servo = SERVO_CENTER
-                    if curr_time - state_timer < STEER_WAIT_TIME:
-                        cmd_speed = 0;
-                        msg = "ALIGN CENTER"
-                    else:
-                        cmd_speed = -SPEED_PARK
-                        driving_time = (curr_time - state_timer) - STEER_WAIT_TIME
-                        msg = f"REVERSE STRAIGHT: {driving_time:.1f}s"
-                        log_text = f"[후진준비] 1초간 직선 후진 중... {driving_time:.1f}초"
-
-                        if driving_time > TIME_REVERSE_PRE:
-                            state = STATE_REVERSE_TURN
-                            state_timer = curr_time
-
-                # ---------------------------------------------------
-                # [3] 후진 진입 (꺾고 6초)
+                # [3] 후진 진입
                 # ---------------------------------------------------
                 elif state == STATE_REVERSE_TURN:
                     cmd_servo = SERVO_RIGHT_MAX
@@ -323,34 +299,27 @@ def main():
                             side_detect_time = 0
 
                 # ---------------------------------------------------
-                # [4] 마무리 후진 (★ 센터링 로직 추가됨)
+                # [4] 마무리 후진 (센터링)
                 # ---------------------------------------------------
                 elif state == STATE_REVERSE_STRAIGHT:
-                    # ★ 센터링 로직: 양쪽 거리 비교해서 조향
-                    # 기본은 중앙
                     target_steer = SERVO_CENTER
 
-                    # 5cm (50mm) 이상 차이나면 보정
                     if abs(dist_LT - dist_RT) > 50:
                         if dist_LT < dist_RT:
-                            # 왼쪽이 더 좁음 -> 꼬리를 오른쪽으로 보내야 함 -> 핸들 오른쪽
                             target_steer = SERVO_CENTER - CENTERING_POWER
                             msg = "CENTERING: >> (Left Close)"
                         else:
-                            # 오른쪽이 더 좁음 -> 꼬리를 왼쪽으로 보내야 함 -> 핸들 왼쪽
                             target_steer = SERVO_CENTER + CENTERING_POWER
                             msg = "CENTERING: << (Right Close)"
                     else:
                         msg = "CENTERING: OK"
 
-                    # 조향 적용
                     if curr_time - state_timer < STEER_WAIT_TIME:
                         cmd_speed = 0
                         cmd_servo = target_steer
                     else:
                         cmd_servo = target_steer
                         cmd_speed = -SPEED_PARK
-
                         log_text = f"[주차중] L:{dist_LT} R:{dist_RT} 조향:{cmd_servo}"
 
                     is_detected = False
@@ -415,7 +384,6 @@ def main():
                             state = STATE_EXIT_STRAIGHT
                             state_timer = curr_time
 
-                # ★ [수정] 출차 후 '탁' 쳐주기
                 elif state == STATE_EXIT_STRAIGHT:
                     drive_time = curr_time - state_timer
 
@@ -425,27 +393,22 @@ def main():
                         msg = "EXIT COMPLETE: ALIGN"
                     else:
                         cmd_speed = SPEED_SEARCH
-
                         real_drive_time = drive_time - STEER_WAIT_TIME
 
-                        # 3초 직진 -> 0.3초간 왼쪽 탁! -> 다시 직진
                         if real_drive_time < 3.0:
                             cmd_servo = SERVO_CENTER
                             msg = f"RUNNING STRAIGHT ({real_drive_time:.1f}s)"
-                        elif real_drive_time < 3.3:  # 3.0 ~ 3.3 (0.3초간)
-                            # ★ 왼쪽으로 '탁' 쳐주기 (15만큼)
+                        elif real_drive_time < 3.3:
                             cmd_servo = SERVO_CENTER + 15
                             msg = "!!! KICK LEFT !!!"
                         else:
-                            # 다시 중앙 정렬
                             cmd_servo = SERVO_CENTER
                             msg = "RUNNING STRAIGHT"
 
                 # ---------------------------------------------------
                 # [로그 & 화면 표시 & 통신]
                 # ---------------------------------------------------
-                if log_text:
-                    print(log_text)
+                if log_text: print(log_text)
 
                 if curr_time - last_serial_time > SERIAL_DELAY:
                     ser.write(f"S,{cmd_servo}\n".encode())
@@ -466,7 +429,6 @@ def main():
                     cv2.putText(debug_img, f"Diff: {int(d_val)}", (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                                 (100, 100, 255), 1)
 
-                # 주차 중에는 초음파 센서 값 표시
                 if state == STATE_REVERSE_STRAIGHT:
                     cv2.putText(debug_img, f"Sonar L:{dist_LT} R:{dist_RT}", (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                                 (255, 100, 100), 1)

@@ -7,14 +7,14 @@ import time
 # ==========================================
 # [1] 환경 및 튜닝 설정
 # ==========================================
-IS_SUNNY = False
+IS_SUNNY = True
 
 PORT = 'COM4'
-BAUDRATE = 115200 # ★ 아두이노와 동일하게
+BAUDRATE = 115200
 SERIAL_DELAY = 0.05
 SPEED_REFRESH_DELAY = 1.0
 
-CAM_INDEX = 0
+CAM_INDEX = 1
 MAX_SPEED = 255
 SERVO_CENTER = 570
 SERVO_LEFT_MAX = 680
@@ -30,12 +30,20 @@ TARGET_RATIO_MAX = 0.10
 
 if IS_SUNNY:
     print("☀️ 모드: SUNNY")
-    current_l_min = 200; MIN_L_VAL = 150; MAX_L_VAL = 240
-    S_MAX_VAL = 50; MORPH_SIZE = (5, 5); BLUR_K = 7
+    current_l_min = 200;
+    MIN_L_VAL = 150;
+    MAX_L_VAL = 240
+    S_MAX_VAL = 50;
+    MORPH_SIZE = (5, 5);
+    BLUR_K = 7
 else:
     print("🌙 모드: NORMAL")
-    current_l_min = 140; MIN_L_VAL = 80; MAX_L_VAL = 220
-    S_MAX_VAL = 80; MORPH_SIZE = (3, 3); BLUR_K = 5
+    current_l_min = 140;
+    MIN_L_VAL = 80;
+    MAX_L_VAL = 220
+    S_MAX_VAL = 80;
+    MORPH_SIZE = (3, 3);
+    BLUR_K = 5
 
 # ==========================================
 # [2] 시리얼 연결
@@ -48,13 +56,15 @@ try:
 except Exception as e:
     print(f"❌ 연결 실패: {e}")
 
+
 # ==========================================
-# [3] 영상 처리 함수들 (그대로 유지)
+# [3] 영상 처리 함수들
 # ==========================================
 def region_of_interest(img, vertices):
     mask = np.zeros_like(img)
     cv2.fillPoly(mask, vertices, 255)
     return cv2.bitwise_and(img, mask)
+
 
 def make_points(image, line_parameters):
     if line_parameters is None: return None
@@ -66,18 +76,24 @@ def make_points(image, line_parameters):
     x2 = int((y2 - intercept) / slope)
     return [[x1, y1, x2, y2]]
 
+
 def average_slope_intercept(image, lines):
-    left_fit = []; right_fit = []
+    left_fit = [];
+    right_fit = []
     if lines is None: return None, None
     for line in lines:
         for x1, y1, x2, y2 in line:
             fit = np.polyfit((x1, x2), (y1, y2), 1)
-            slope = fit[0]; intercept = fit[1]
-            if slope < -0.5: left_fit.append((slope, intercept))
-            elif slope > 0.5: right_fit.append((slope, intercept))
+            slope = fit[0];
+            intercept = fit[1]
+            if slope < -0.5:
+                left_fit.append((slope, intercept))
+            elif slope > 0.5:
+                right_fit.append((slope, intercept))
     left_line = make_points(image, np.mean(left_fit, axis=0)) if len(left_fit) > 0 else None
     right_line = make_points(image, np.mean(right_fit, axis=0)) if len(right_fit) > 0 else None
     return left_line, right_line
+
 
 def calculate_steering_angle(image, left_line, right_line):
     global last_target_x
@@ -97,8 +113,10 @@ def calculate_steering_angle(image, left_line, right_line):
     dy = (height - target_y)
     return math.degrees(math.atan2(dx, abs(dy))), int(target_x)
 
+
 def map_value(x, in_min, in_max, out_min, out_max):
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+
 
 # ==========================================
 # [4] 메인 실행
@@ -106,8 +124,11 @@ def map_value(x, in_min, in_max, out_min, out_max):
 def main():
     global current_l_min
     cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
-    width = 640; height = 480
-    cap.set(3, width); cap.set(4, height); cap.set(15, -6)
+    width = 640;
+    height = 480
+    cap.set(3, width);
+    cap.set(4, height);
+    cap.set(15, -6)
 
     if not cap.isOpened(): print("❌ 카메라 오류"); return
     print("\n🚀 3초 후 출발!");
@@ -119,14 +140,13 @@ def main():
 
     try:
         while True:
-            # ★ [핵심 추가] 아두이노가 보내는 초음파 데이터를 읽어서 버려야 함!
-            # 안 그러면 PC 버퍼가 꽉 차서 아두이노가 전송을 멈추고(Blocking) 죽어버림.
+            # 아두이노 데이터 비우기 (버퍼 오버플로우 방지)
             if ser:
                 try:
-                    # 데이터가 쌓여있으면 싹 비워버림
                     if ser.in_waiting > 0:
                         ser.read(ser.in_waiting)
-                except: pass
+                except:
+                    pass
 
             ret, frame = cap.read()
             if not ret: break
@@ -156,8 +176,10 @@ def main():
             if total_area == 0: total_area = 1
             ratio = white_count / total_area
 
-            if ratio > TARGET_RATIO_MAX: current_l_min = min(current_l_min + 2, MAX_L_VAL)
-            elif ratio < TARGET_RATIO_MIN: current_l_min = max(current_l_min - 2, MIN_L_VAL)
+            if ratio > TARGET_RATIO_MAX:
+                current_l_min = min(current_l_min + 2, MAX_L_VAL)
+            elif ratio < TARGET_RATIO_MIN:
+                current_l_min = max(current_l_min - 2, MIN_L_VAL)
 
             # 3. 주행 계산
             edges = cv2.Canny(mask, 50, 150)
@@ -177,12 +199,23 @@ def main():
                     ser.write(f"D,{MAX_SPEED}\n".encode())
                     last_speed_time = curr_time
 
-            # 5. 디스플레이
+            # 5. 디스플레이 (수정된 부분)
+            # 마스크 컬러 변환
             mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-            cv2.polylines(frame, [roi_points], True, (255, 0, 0), 2)
+
+            # ROI 박스 그리기 (마스크 화면에 노란색으로)
+            cv2.polylines(mask_bgr, [roi_points], True, (0, 255, 255), 2)
+
+            # 타겟 포인트 그리기 (원본 화면에 빨간색 점)
             cv2.circle(frame, (target, int(h * ROI_HEIGHT_RATIO)), 10, (0, 0, 255), -1)
+
+            # 화면 합치기
             combined = np.hstack((frame, mask_bgr))
-            cv2.putText(combined, f"L-Min: {current_l_min} | Ratio: {ratio * 100:.1f}%", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+            # 텍스트 출력
+            cv2.putText(combined, f"L-Min: {current_l_min} | Ratio: {ratio * 100:.1f}%", (20, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
             cv2.imshow("HLS + ROI Visualized (Auto)", combined)
             if cv2.waitKey(1) == ord('q'): break
 
@@ -194,7 +227,9 @@ def main():
         if ser:
             for _ in range(3): ser.write(b"D,0\n"); ser.write(b"S,570\n"); time.sleep(0.05)
             ser.close()
-        cap.release(); cv2.destroyAllWindows()
+        cap.release();
+        cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
