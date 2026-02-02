@@ -52,8 +52,8 @@ TARGET_RATIO_MAX = 0.10
 print("\n" + "=" * 40)
 
 # ★ [수정 1] 노출값 변수 초기화 (오류 방지)
-traffic_exp_value = -7 # 기본값
-lane_exp_value = -7    # ★ 차선 카메라도 -4 -> -7로 변경 (하얀 화면 해결용)
+traffic_exp_value = 12 # 기본값
+lane_exp_value = -12    # ★ 차선 카메라도 -4 -> -7로 변경 (하얀 화면 해결용)
 
 if IS_SUNNY:
     print("   ☀️  현재 모드: SUNNY (햇빛 강함) ☀️")
@@ -64,8 +64,8 @@ if IS_SUNNY:
     S_MAX = 50; MORPH_SIZE = (5, 5); BLUR_K = 7
 else:
     print("   🌙  현재 모드: NORMAL (실내/흐림) 🌙")
-    traffic_exp_value = -7  # 신호등 어둡게
-    lane_exp_value = -7     # ★ 차선 수정됨 (기존 -4는 너무 밝음)
+    traffic_exp_value = -12  # 신호등 어둡게
+    lane_exp_value = -12     # ★ 차선 수정됨 (기존 -4는 너무 밝음)
     
     current_l_min = 140; MIN_L_VAL = 80; MAX_L_VAL = 220
     S_MAX = 80; MORPH_SIZE = (3, 3); BLUR_K = 5
