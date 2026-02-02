@@ -30,14 +30,14 @@ SERVO_LEFT_MAX = 680
 SERVO_RIGHT_MAX = 480
 
 # --- 장애물 회피 설정 ---
-OBSTACLE_START_DIST = 1000
-SHIFT_GAIN = 1.2
+OBSTACLE_START_DIST = 1600
+SHIFT_GAIN = 1.5
 OBSTACLE_CLEAR_TIME = 1.5
 
 # --- ROI 설정 ---
-ROI_LANE_HEIGHT_RATIO = 0.6
-ROI_LANE_X_LEFT = 0.3125
-ROI_LANE_X_RIGHT = 0.6875
+ROI_LANE_HEIGHT_RATIO = 0.5
+ROI_LANE_X_LEFT = 0.2125
+ROI_LANE_X_RIGHT = 0.7875
 
 # --- 횡단보도 설정 ---
 CROSSWALK_RATIO_MIN = 0.08  
@@ -52,7 +52,7 @@ TARGET_RATIO_MAX = 0.10
 print("\n" + "=" * 40)
 
 # ★ [수정 1] 노출값 변수 초기화 (오류 방지)
-traffic_exp_value = -10 # 기본값
+traffic_exp_value = -11 # 기본값
 lane_exp_value = -10    # ★ 차선 카메라도 -4 -> -7로 변경 (하얀 화면 해결용)
 
 if IS_SUNNY:
@@ -64,7 +64,7 @@ if IS_SUNNY:
     S_MAX = 50; MORPH_SIZE = (5, 5); BLUR_K = 7
 else:
     print("   🌙  현재 모드: NORMAL (실내/흐림) 🌙")
-    traffic_exp_value = -10  # 신호등 어둡게
+    traffic_exp_value = -11  # 신호등 어둡게
     lane_exp_value = -10     # ★ 차선 수정됨 (기존 -4는 너무 밝음)
     
     current_l_min = 140; MIN_L_VAL = 80; MAX_L_VAL = 220
@@ -244,8 +244,8 @@ try:
         # 1. 라이다
         raw_dist = 2000
         for (_, angle, dist) in scan:
-            if 200 < dist < 1500:
-                if angle >= 330 or angle <= 30:
+            if 200 < dist < 2500:
+                if angle >= 320 or angle <= 40:
                     if dist < raw_dist: raw_dist = dist
 
         # 2. 영상 읽기
