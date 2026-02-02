@@ -242,7 +242,7 @@ try:
         read_sensors()
 
         # 1. 라이다
-        raw_dist = 2000
+        raw_dist = 3000
         for (_, angle, dist) in scan:
             if 200 < dist < 2500:
                 if angle >= 320 or angle <= 40:
