@@ -14,8 +14,9 @@ IS_SUNNY = False  # ★ 환경에 맞춰 설정
 ARDUINO_PORT = 'COM4'
 LIDAR_PORT = 'COM3'
 
-CAM_IDX_TRAFFIC = 0
-CAM_IDX_LANE = 1
+# ✅ 네 단독 라인트레이싱 코드와 "카메라 인덱스/오픈 방식" 동일
+CAM_IDX_TRAFFIC = 0   # 신호등 카메라
+CAM_IDX_LANE = 1      # 차선 카메라
 
 # --- 통신 설정 ---
 SERIAL_DELAY = 0.05
@@ -23,8 +24,9 @@ SPEED_REFRESH_DELAY = 1.0
 
 # --- 속도 & 모터 설정 ---
 SPEED_NORMAL = 100
-SPEED_SLOW = 100
+SPEED_SLOW = 70        # ✅ 감속이 되게 조정(원하면 100으로 되돌려도 됨)
 SPEED_STOP = 0
+
 SERVO_CENTER = 570
 SERVO_LEFT_MAX = 680
 SERVO_RIGHT_MAX = 480
@@ -52,19 +54,19 @@ TARGET_RATIO_MAX = 0.10
 print("\n" + "=" * 40)
 if IS_SUNNY:
     print("   ☀️  현재 모드: SUNNY (햇빛 강함) ☀️")
-    current_l_min = 200;
-    MIN_L_VAL = 150;
+    current_l_min = 200
+    MIN_L_VAL = 150
     MAX_L_VAL = 240
-    S_MAX = 50;
-    MORPH_SIZE = (5, 5);
+    S_MAX = 50
+    MORPH_SIZE = (5, 5)
     BLUR_K = 7
 else:
     print("   🌙  현재 모드: NORMAL (실내/흐림) 🌙")
-    current_l_min = 140;
-    MIN_L_VAL = 80;
+    current_l_min = 140
+    MIN_L_VAL = 80
     MAX_L_VAL = 220
-    S_MAX = 80;
-    MORPH_SIZE = (3, 3);
+    S_MAX = 80
+    MORPH_SIZE = (3, 3)
     BLUR_K = 5
 print("=" * 40 + "\n")
 
@@ -72,10 +74,11 @@ print("=" * 40 + "\n")
 # [2] 함수 정의
 # ==========================================
 sonar_data = [999] * 6
+ser = None  # read_sensors에서 사용
 
 
 def read_sensors():
-    global sonar_data
+    global sonar_data, ser
     if ser is not None:
         while ser.in_waiting > 0:
             try:
@@ -101,26 +104,31 @@ def make_points(image, line_parameters):
         return None
     y1 = image.shape[0]
     y2 = int(y1 * ROI_LANE_HEIGHT_RATIO)
-    if slope == 0: slope = 0.001
+    if slope == 0:
+        slope = 0.001
     x1 = int((y1 - intercept) / slope)
     x2 = int((y2 - intercept) / slope)
     return [[x1, y1, x2, y2]]
 
 
 def average_slope_intercept(image, lines):
-    left_fit = [];
+    left_fit = []
     right_fit = []
-    if lines is None: return None, None
+    if lines is None:
+        return None, None
+
     for line in lines:
         for x1, y1, x2, y2 in line:
-            if x1 == x2: continue
+            if x1 == x2:
+                continue
             fit = np.polyfit((x1, x2), (y1, y2), 1)
-            slope = fit[0];
+            slope = fit[0]
             intercept = fit[1]
             if slope < -0.5:
                 left_fit.append((slope, intercept))
             elif slope > 0.5:
                 right_fit.append((slope, intercept))
+
     left_line = make_points(image, np.mean(left_fit, axis=0)) if len(left_fit) > 0 else None
     right_line = make_points(image, np.mean(right_fit, axis=0)) if len(right_fit) > 0 else None
     return left_line, right_line
@@ -167,13 +175,15 @@ def detect_stop_line(mask, frame_to_draw, roi_ratio=0.6):
     roi = mask[roi_h:h, 0:w]
     edges = cv2.Canny(roi, 50, 150)
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=20, minLineLength=40, maxLineGap=20)
+
     detected = False
     if lines is not None:
         for line in lines:
             x1, y1, x2, y2 = line[0]
-            if x2 - x1 == 0: continue
-            angle = np.arctan2(y2 - y1, x2 - x1) * 180.0 / np.pi
-            if abs(angle) < 30:
+            if x2 - x1 == 0:
+                continue
+            ang = np.arctan2(y2 - y1, x2 - x1) * 180.0 / np.pi
+            if abs(ang) < 30:
                 cv2.line(frame_to_draw, (x1, y1 + roi_h), (x2, y2 + roi_h), (0, 255, 255), 3)
                 detected = True
     return detected
@@ -182,92 +192,93 @@ def detect_stop_line(mask, frame_to_draw, roi_ratio=0.6):
 # ==========================================
 # [3] 초기화
 # ==========================================
-lidar = None;
-ser = None
-cap_traffic = None;
+lidar = None
+cap_traffic = None
 cap_lane = None
 camera_lib = None
 video_writer = None
 
 try:
+    # 시리얼 / 라이다 / 신호등 라이브러리
     ser = serial.Serial(ARDUINO_PORT, 115200, timeout=0.1)
     lidar = RPLidar(LIDAR_PORT)
     camera_lib = libCAMERA()
 
+    # ✅ 카메라 오픈: 네 단독 코드와 "정확히 동일"
     cap_traffic = cv2.VideoCapture(CAM_IDX_TRAFFIC, cv2.CAP_DSHOW)
-    cap_traffic.set(3, 640);
-    cap_traffic.set(4, 480);
-    cap_traffic.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-    if IS_SUNNY:
-        cap_traffic.set(cv2.CAP_PROP_EXPOSURE, -6)
-    else:
-        cap_traffic.set(cv2.CAP_PROP_EXPOSURE, -4)
-
     cap_lane = cv2.VideoCapture(CAM_IDX_LANE, cv2.CAP_DSHOW)
-    cap_lane.set(3, 640);
-    cap_lane.set(4, 480);
-    cap_lane.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-    cap_lane.set(cv2.CAP_PROP_EXPOSURE, -4)
+
+    width, height = 640, 480
+
+    cap_traffic.set(3, width)
+    cap_traffic.set(4, height)
+    cap_traffic.set(15, -6)  # ✅ 단독 코드와 동일
+
+    cap_lane.set(3, width)
+    cap_lane.set(4, height)
+    cap_lane.set(15, -6)     # ✅ 단독 코드와 동일
 
     if not cap_traffic.isOpened() or not cap_lane.isOpened():
-        raise Exception("❌ 카메라 연결 실패")
+        raise Exception("❌ 카메라 연결 실패 (인덱스 확인 필요)")
 
     fourcc = cv2.VideoWriter_fourcc(*'XVID')
     video_writer = cv2.VideoWriter('final_run.avi', fourcc, 20.0, (1280, 480))
 
     print("✅ 준비 완료 (3초 대기)")
     time.sleep(3)
-    if ser: ser.write(f"D,{SPEED_NORMAL}\n".encode())
+    if ser:
+        ser.write(f"D,{SPEED_NORMAL}\n".encode())
 
 except Exception as e:
     print(f"❌ 초기화 오류: {e}")
-    exit()
+    raise SystemExit
+
 
 # ==========================================
 # [4] 메인 루프
 # ==========================================
-last_valid_angle = 0
-last_serial_time = 0
-last_speed_time = 0
+last_valid_angle = 0.0
+last_serial_time = 0.0
+last_speed_time = 0.0
 
 is_crosswalk_stop = False
-crosswalk_start_time = 0
-crosswalk_cooldown_timer = 0
-crosswalk_detect_timer = 0
+crosswalk_start_time = 0.0
+crosswalk_cooldown_timer = 0.0
+crosswalk_detect_timer = 0.0
 
 obstacle_count = 0
 is_obstacle_detected = False
-obs_clear_finished_time = 0
-obstacle_last_seen_time = 0
+obs_clear_finished_time = 0.0
+obstacle_last_seen_time = 0.0
 
 try:
     print("🚀 주행 시작")
     for scan in lidar.iter_scans():
         read_sensors()
 
-        # 1. 라이다
+        # 1) 라이다 전방 최소거리
         raw_dist = 2000
-        for (_, angle, dist) in scan:
+        for (_, ang, dist) in scan:
             if 200 < dist < 1500:
-                if angle >= 330 or angle <= 30:
-                    if dist < raw_dist: raw_dist = dist
+                if ang >= 330 or ang <= 30:
+                    if dist < raw_dist:
+                        raw_dist = dist
 
-        # 2. 영상 읽기
+        # 2) 영상 읽기
         ret_t, frame_traffic = cap_traffic.read()
         ret_l, frame_lane = cap_lane.read()
-
         if not ret_t or not ret_l:
-            print("❌ 카메라 신호 끊김");
+            print("❌ 카메라 신호 끊김")
             break
 
         frame_traffic = cv2.resize(frame_traffic, (640, 480))
         frame_lane = cv2.resize(frame_lane, (640, 480))
         h, w = frame_lane.shape[:2]
 
-        # 3. [Cam 0] 신호등
+        # 3) [Cam 0] 신호등
         traffic_light = camera_lib.object_detection(frame_traffic, sample=3, print_enable=False)
 
-        # 4. [Cam 1] 차선 처리 & 바이너리
+        # 4) [Cam 1] 차선 처리 & 바이너리
         blurred = cv2.medianBlur(frame_lane, BLUR_K)
         hls = cv2.cvtColor(blurred, cv2.COLOR_BGR2HLS)
         mask = cv2.inRange(hls, np.array([0, current_l_min, 0]), np.array([179, 255, S_MAX]))
@@ -286,24 +297,25 @@ try:
 
         white_count = cv2.countNonZero(roi_pixels)
         total_area = cv2.contourArea(lane_roi_points)
-        if total_area == 0: total_area = 1
+        if total_area == 0:
+            total_area = 1
         ratio = white_count / total_area
 
         # 자동 튜닝
         tuning_msg = "Hold"
         if ratio < CROSSWALK_RATIO_MIN:
             if ratio > TARGET_RATIO_MAX:
-                current_l_min = min(current_l_min + 2, MAX_L_VAL);
+                current_l_min = min(current_l_min + 2, MAX_L_VAL)
                 tuning_msg = "Up (Dark)"
             elif ratio < TARGET_RATIO_MIN:
                 if ratio < 0.005:
-                    current_l_min = max(current_l_min - 10, MIN_L_VAL);
+                    current_l_min = max(current_l_min - 10, MIN_L_VAL)
                     tuning_msg = "!! DOWN FAST !!"
                 else:
-                    current_l_min = max(current_l_min - 2, MIN_L_VAL);
+                    current_l_min = max(current_l_min - 2, MIN_L_VAL)
                     tuning_msg = "Down (Bright)"
 
-        # 5. 주행 로직
+        # 5) 주행 로직
         status_msg = "NORMAL"
         status_color = (0, 255, 0)
         final_speed = SPEED_NORMAL
@@ -320,15 +332,15 @@ try:
                     print(f"⚠️ 장애물 #{obstacle_count} 감지!")
 
             if obstacle_count == 1:
-                avoid_direction = -1;
-                status_msg = f"AVOID LEFT (#1)";
+                avoid_direction = -1
+                status_msg = "AVOID LEFT (#1)"
                 status_color = (0, 255, 255)
             elif obstacle_count == 2:
-                avoid_direction = 1;
-                status_msg = f"AVOID RIGHT (#2)";
+                avoid_direction = 1
+                status_msg = "AVOID RIGHT (#2)"
                 status_color = (255, 0, 255)
             else:
-                status_msg = f"OBSTACLE #{obstacle_count}";
+                status_msg = f"OBSTACLE #{obstacle_count}"
                 final_speed = SPEED_SLOW
 
         # (B) 장애물 없음 (복귀)
@@ -339,71 +351,61 @@ try:
                         avoid_direction = -1
                     elif obstacle_count == 2:
                         avoid_direction = 1
-                    status_msg = f"CLEARING... ({current_time - obstacle_last_seen_time:.1f}s)";
+                    status_msg = f"CLEARING... ({current_time - obstacle_last_seen_time:.1f}s)"
                     status_color = (0, 100, 255)
                 else:
                     is_obstacle_detected = False
                     obs_clear_finished_time = current_time
-                    print(f"✅ 복귀");
+                    print("✅ 복귀")
                     avoid_direction = 0
             else:
                 avoid_direction = 0
 
-        # (C) 횡단보도 및 신호등 로직
-        # 1. 이미 정지 상태
+        # (C) 횡단보도 및 신호등
         if is_crosswalk_stop:
             final_speed = SPEED_STOP
             elapsed = current_time - crosswalk_start_time
             if traffic_light == "GREEN":
-                is_crosswalk_stop = False;
-                crosswalk_cooldown_timer = current_time;
+                is_crosswalk_stop = False
+                crosswalk_cooldown_timer = current_time
                 crosswalk_detect_timer = 0
-                print(f"🟢 GO!")
+                print("🟢 GO!")
             elif elapsed > CROSSWALK_MAX_WAIT:
-                is_crosswalk_stop = False;
-                crosswalk_cooldown_timer = current_time;
+                is_crosswalk_stop = False
+                crosswalk_cooldown_timer = current_time
                 crosswalk_detect_timer = 0
-                print(f"⚠️ Timeout GO!")
+                print("⚠️ Timeout GO!")
             else:
-                status_msg = f"WAIT GREEN.. ({elapsed:.1f}s)";
+                status_msg = f"WAIT GREEN.. ({elapsed:.1f}s)"
                 status_color = (0, 0, 255)
 
-        # 2. 정지선 감지 시도 (ROI 조건)
         elif (ratio > CROSSWALK_RATIO_MIN) and (current_time - crosswalk_cooldown_timer > CROSSWALK_COOLDOWN):
-            # 정지선(가로선)이 있는가?
             if detect_stop_line(mask, mask_bgr, ROI_LANE_HEIGHT_RATIO):
-                # ★ [핵심] 신호등이 'RED'일 때만 정지 로직 진입!
                 if traffic_light == "RED":
                     if crosswalk_detect_timer == 0:
                         crosswalk_detect_timer = current_time
                     elif current_time - crosswalk_detect_timer > CROSSWALK_CONFIRM_TIME:
-                        is_crosswalk_stop = True;
-                        crosswalk_start_time = current_time;
+                        is_crosswalk_stop = True
+                        crosswalk_start_time = current_time
                         final_speed = SPEED_STOP
-                        status_msg = "STOP! (Line+RED)";
-                        status_color = (0, 0, 255);
+                        status_msg = "STOP! (Line+RED)"
+                        status_color = (0, 0, 255)
                         crosswalk_detect_timer = 0
                     else:
                         status_msg = "Checking Line+RED..."
                 else:
-                    # 정지선은 있지만, 빨간불이 아님 -> 통과 (타이머 리셋)
                     crosswalk_detect_timer = 0
                     status_msg = f"Line Detected ({traffic_light})"
             else:
                 crosswalk_detect_timer = 0
-                if ratio > 0.3: status_msg = "Glare Ignored"
+                if ratio > 0.3:
+                    status_msg = "Glare Ignored"
         else:
             crosswalk_detect_timer = 0
-            # 정지선 없는 일반 주행 중 빨간불/장애물 체크
-            if traffic_light == "RED" and not is_crosswalk_stop:
-                # 횡단보도 아닌데 빨간불? -> 보통은 그냥 둠 (횡단보도에서만 서기로 했으므로)
-                # 만약 언제든 빨간불이면 서게 하려면 아래 주석 해제
-                # final_speed = SPEED_STOP; status_msg = "RED LIGHT"; status_color = (0, 0, 255)
-                pass
-            elif raw_dist < 800:
+            if raw_dist < 800:
                 final_speed = SPEED_SLOW
 
-        # 6. 조향
+        # 6) 조향 (라인 기반 + 회피 shift)
         edges = cv2.Canny(mask, 50, 150)
         cropped = region_of_interest(edges, lane_roi_points)
         lines = cv2.HoughLinesP(cropped, 1, np.pi / 180, 50, minLineLength=40, maxLineGap=100)
@@ -413,21 +415,26 @@ try:
         if avoid_direction != 0 and raw_dist > OBSTACLE_START_DIST:
             eff_dist = OBSTACLE_START_DIST / 2
 
-        final_angle, target_px, shift_val = calculate_avoid_angle(frame_lane, l_line, r_line, eff_dist,
-                                                                  last_valid_angle, avoid_direction)
+        final_angle, target_px, shift_val = calculate_avoid_angle(
+            frame_lane, l_line, r_line, eff_dist, last_valid_angle, avoid_direction
+        )
         last_valid_angle = final_angle
 
+        # 7) 통신
         if ser:
             if current_time - last_serial_time > SERIAL_DELAY:
                 pwm_cmd = map_servo(final_angle)
                 ser.write(f"S,{pwm_cmd}\n".encode())
                 last_serial_time = current_time
+
             if current_time - last_speed_time > SPEED_REFRESH_DELAY:
                 ser.write(f"D,{final_speed}\n".encode())
                 last_speed_time = current_time
 
-        # 7. 디스플레이
-        cv2.putText(frame_traffic, f"Light: {traffic_light}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+        # 8) 디스플레이
+        cv2.putText(frame_traffic, f"Light: {traffic_light}", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+
         if traffic_light == "RED":
             cv2.circle(frame_traffic, (50, 100), 20, (0, 0, 255), -1)
         elif traffic_light == "GREEN":
@@ -436,23 +443,43 @@ try:
         cv2.polylines(mask_bgr, [lane_roi_points], True, (0, 100, 255), 2)
         cv2.circle(mask_bgr, (target_px, int(h * ROI_LANE_HEIGHT_RATIO)), 10, (0, 0, 255), -1)
 
-        cv2.putText(mask_bgr, f"L-Min:{current_l_min} ({tuning_msg})", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (255, 255, 0), 2)
-        cv2.putText(mask_bgr, f"Ratio: {ratio * 100:.1f}%", (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
-        cv2.putText(mask_bgr, status_msg, (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+        cv2.putText(mask_bgr, f"L-Min:{current_l_min} ({tuning_msg})", (20, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        cv2.putText(mask_bgr, f"Ratio: {ratio * 100:.1f}%", (20, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+        cv2.putText(mask_bgr, status_msg, (20, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
 
         combined_view = np.hstack((frame_traffic, mask_bgr))
         cv2.imshow("Dual View", combined_view)
 
-        if video_writer is not None: video_writer.write(combined_view)
-        if cv2.waitKey(1) == ord('q'): break
+        if video_writer is not None:
+            video_writer.write(combined_view)
+
+        if cv2.waitKey(1) == ord('q'):
+            break
 
 except KeyboardInterrupt:
     print("사용자 종료")
+
 finally:
-    if lidar: lidar.stop(); lidar.disconnect()
-    if ser: ser.write(b"D,0\n"); ser.write(b"S,570\n"); ser.close()
-    if video_writer is not None: video_writer.release()
-    if cap_traffic: cap_traffic.release()
-    if cap_lane: cap_lane.release()
+    if lidar:
+        try:
+            lidar.stop()
+            lidar.disconnect()
+        except:
+            pass
+    if ser:
+        try:
+            ser.write(b"D,0\n")
+            ser.write(b"S,570\n")
+            ser.close()
+        except:
+            pass
+    if video_writer is not None:
+        video_writer.release()
+    if cap_traffic is not None:
+        cap_traffic.release()
+    if cap_lane is not None:
+        cap_lane.release()
     cv2.destroyAllWindows()
