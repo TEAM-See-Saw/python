@@ -14,7 +14,7 @@ BAUDRATE = 115200  # ★ 아두이노와 속도 일치
 try:
     ser = serial.Serial(PORT, BAUDRATE, timeout=1)
     time.sleep(2)
-    # 시작 전 버퍼 한번 비우기
+    # 시작 전 버퍼 한번 비우기q
     ser.reset_input_buffer()
     print("✅ 아두이노 연결 성공. 리플레이 준비...")
 except Exception as e:

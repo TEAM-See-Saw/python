@@ -17,7 +17,7 @@ LIDAR_PORT = 'COM3'
 CAM_IDX_TRAFFIC = 0     # 신호등 카메라 번호
 CAM_IDX_LANE = 1        # 차선 카메라 번호
 
-# --- 통신 설정 ---
+# --- 통신 설정 ---q
 SERIAL_DELAY = 0.05
 SPEED_REFRESH_DELAY = 0.5  # 속도 갱신 주기
 
@@ -52,20 +52,20 @@ TARGET_RATIO_MAX = 0.10
 print("\n" + "=" * 40)
 
 # ★ [수정 1] 노출값 변수 초기화 (오류 방지)
-traffic_exp_value = 12 # 기본값
-lane_exp_value = -12    # ★ 차선 카메라도 -4 -> -7로 변경 (하얀 화면 해결용)
+traffic_exp_value = -10 # 기본값
+lane_exp_value = -10    # ★ 차선 카메라도 -4 -> -7로 변경 (하얀 화면 해결용)
 
 if IS_SUNNY:
     print("   ☀️  현재 모드: SUNNY (햇빛 강함) ☀️")
-    traffic_exp_value = -9  # 신호등 더 어둡게
-    lane_exp_value = -8     # 차선도 더 어둡게
+    traffic_exp_value = -6  # 신호등 더 어둡게
+    lane_exp_value = -6     # 차선도 더 어둡게
     
     current_l_min = 200; MIN_L_VAL = 150; MAX_L_VAL = 240
     S_MAX = 50; MORPH_SIZE = (5, 5); BLUR_K = 7
 else:
     print("   🌙  현재 모드: NORMAL (실내/흐림) 🌙")
-    traffic_exp_value = -12  # 신호등 어둡게
-    lane_exp_value = -12     # ★ 차선 수정됨 (기존 -4는 너무 밝음)
+    traffic_exp_value = -10  # 신호등 어둡게
+    lane_exp_value = -10     # ★ 차선 수정됨 (기존 -4는 너무 밝음)
     
     current_l_min = 140; MIN_L_VAL = 80; MAX_L_VAL = 220
     S_MAX = 80; MORPH_SIZE = (3, 3); BLUR_K = 5

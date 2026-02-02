@@ -9,7 +9,7 @@ from Function_Library import libCAMERA
 # ==========================================
 # [1] 환경 및 튜닝 설정
 # ==========================================
-IS_SUNNY = False  # ★ 환경에 맞춰 설정
+IS_SUNNY = True  # ★ 환경에 맞춰 설정
 
 ARDUINO_PORT = 'COM4'
 LIDAR_PORT = 'COM3'
@@ -24,7 +24,7 @@ SPEED_REFRESH_DELAY = 1.0
 
 # --- 속도 & 모터 설정 ---
 SPEED_NORMAL = 100
-SPEED_SLOW = 70        # ✅ 감속이 되게 조정(원하면 100으로 되돌려도 됨)
+SPEED_SLOW = 50        # ✅ 감속이 되게 조정(원하면 100으로 되돌려도 됨)
 SPEED_STOP = 0
 
 SERVO_CENTER = 570
