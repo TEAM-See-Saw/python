@@ -4,124 +4,95 @@ import math
 import serial
 import time
 
-from rplidar import RPLidar  # pip install rplidar
-
 # ==========================================
 # [1] 환경 및 튜닝 설정
 # ==========================================
 IS_SUNNY = True
 
-# ---- 포트 설정(요청 반영) ----
-ARDUINO_PORT = 'COM4'
-LIDAR_PORT = 'COM3'
-
+PORT = 'COM4'
 BAUDRATE = 115200
 SERIAL_DELAY = 0.05
 SPEED_REFRESH_DELAY = 1.0
 
-# ---- Camera (COM1 -> 보통 OpenCV index=1) ----
-CAM_INDEX = 1   # ✅ 요청 반영
-WIDTH, HEIGHT = 640, 480
+CAM_INDEX = 1
+MAX_SPEED = 255
 
-# ---- Speed ----
-SPEED_NORMAL = 120
-SPEED_SLOW = 80
-SPEED_STOP = 0
-
-# ---- Servo PWM (✅ 왼쪽 480, 오른쪽 680) ----
+# ✅ (이전 대화 기준) 왼쪽 480 / 오른쪽 680 / 센터 570
 SERVO_CENTER = 570
 SERVO_LEFT_MAX = 480
 SERVO_RIGHT_MAX = 680
 
-# ---- ROI ----
 ROI_HEIGHT_RATIO = 0.6
 ROI_X_LEFT_RATIO = 0.3125
 ROI_X_RIGHT_RATIO = 0.6875
 
-# ---- Auto Tuning ----
-last_target_x = WIDTH // 2
+# 타겟 필터(시간 저역통과)
+target_x_f = 320  # filtered target
+TARGET_LPF_ALPHA = 0.2  # 0.1~0.3 추천 (작을수록 더 부드러움)
+
+# Auto tuning 목표(“퍼센타일 기반”이지만, 하한값을 천천히 조절하는 용도)
+current_l_min = 200
 TARGET_RATIO_MIN = 0.03
 TARGET_RATIO_MAX = 0.10
 
+# ratio EMA + 튜닝 주기 제한
+ratio_ema = None
+RATIO_EMA_ALPHA = 0.15         # 0.1~0.2 추천
+TUNE_PERIOD_SEC = 0.2          # ✅ 프레임마다 튜닝 금지
+last_tune_time = 0.0
+
+# 퍼센타일 기반 임계값 클램프
+L_THR_MIN = 140
+L_THR_MAX = 235
+
+# 채도(S) 하한 클램프(글레어 억제)
+S_THR_MIN = 20
+S_THR_MAX = 90
+
+# 전처리 파라미터
 if IS_SUNNY:
     print("☀️ 모드: SUNNY")
-    current_l_min = 200
     MIN_L_VAL = 150
     MAX_L_VAL = 240
     S_MAX_VAL = 50
-    MORPH_SIZE = (5, 5)
+    MORPH_OPEN_SIZE = (5, 5)
+    MORPH_CLOSE_SIZE = (7, 7)
     BLUR_K = 7
 else:
     print("🌙 모드: NORMAL")
-    current_l_min = 140
     MIN_L_VAL = 80
     MAX_L_VAL = 220
     S_MAX_VAL = 80
-    MORPH_SIZE = (3, 3)
+    MORPH_OPEN_SIZE = (3, 3)
+    MORPH_CLOSE_SIZE = (5, 5)
     BLUR_K = 5
 
 
 # ==========================================
-# [2] 장애물/회피(정지 후) 설정 (단위: mm)
-# ==========================================
-ROAD_W_MM = 850
-CAR_W_MM = 650
-SAFETY_MM = 50
-REQ_GAP_MM = CAR_W_MM + 2 * SAFETY_MM  # 통과에 필요한 최소 통로 폭
-
-# ✅ 거리 보장(정지 후 회피가 안전거리 확보되도록)
-STOP_TRIGGER_MM = 1400   # 이 거리 안이면 "정지 상태로 진입"
-TURN_SAFE_MM = 1100      # 정지 후, 이 거리 이상일 때만 출발/차선변경
-CRASH_GUARD_MM = 700     # 이 이하로 가까우면 절대 출발 금지(정지 유지)
-CLEAR_MM = 1600          # 장애물 충분히 멀어지면 복귀 판단
-
-STOP_BEFORE_AVOID_SEC = 0.6
-LANECHANGE_RAMP_SEC = 0.7
-SWITCH_COOLDOWN = 1.0
-
-# 라인트레이싱 기반 차선 변경: target_x에 픽셀 오프셋을 걸어 "라인을 타면서" 옆차선으로 이동
-DEFAULT_LANE_W_PX = 220
-SHIFT_RATIO = 0.55  # lane width * 0.55 만큼 좌/우 이동(너무 크면 침범 위험)
-
-
-# ==========================================
-# [3] Arduino 시리얼 연결
+# [2] 시리얼 연결
 # ==========================================
 ser = None
 try:
-    ser = serial.Serial(ARDUINO_PORT, BAUDRATE, timeout=0.1)
-    print(f"✅ Arduino {ARDUINO_PORT} 연결 성공! (2초 대기)")
+    ser = serial.Serial(PORT, BAUDRATE, timeout=0.1)
+    print(f"✅ {PORT} 포트 연결 성공! (2초 대기)")
     time.sleep(2)
 except Exception as e:
-    print(f"❌ Arduino 연결 실패: {e}")
+    print(f"❌ 연결 실패: {e}")
     ser = None
 
 
 # ==========================================
-# [4] LiDAR 연결
-# ==========================================
-lidar = None
-scan_gen = None
-try:
-    lidar = RPLidar(LIDAR_PORT)
-    scan_gen = lidar.iter_scans()
-    print(f"✅ LiDAR {LIDAR_PORT} 연결 성공!")
-except Exception as e:
-    print(f"⚠️ LiDAR 연결 실패(장애물 회피 비활성): {e}")
-    lidar = None
-    scan_gen = None
-
-
-# ==========================================
-# [5] 유틸/라인 함수
+# [3] 영상 처리 함수들
 # ==========================================
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
+
 
 def region_of_interest(img, vertices):
     mask = np.zeros_like(img)
     cv2.fillPoly(mask, vertices, 255)
     return cv2.bitwise_and(img, mask)
+
 
 def make_points(image, line_parameters):
     if line_parameters is None:
@@ -135,11 +106,13 @@ def make_points(image, line_parameters):
     x2 = int((y2 - intercept) / slope)
     return [[x1, y1, x2, y2]]
 
+
 def average_slope_intercept(image, lines):
     left_fit = []
     right_fit = []
     if lines is None:
         return None, None
+
     for line in lines:
         for x1, y1, x2, y2 in line:
             if x1 == x2:
@@ -151,35 +124,41 @@ def average_slope_intercept(image, lines):
                 left_fit.append((slope, intercept))
             elif slope > 0.5:
                 right_fit.append((slope, intercept))
+
     left_line = make_points(image, np.mean(left_fit, axis=0)) if len(left_fit) > 0 else None
     right_line = make_points(image, np.mean(right_fit, axis=0)) if len(right_fit) > 0 else None
     return left_line, right_line
 
-def calculate_steering_angle(image, left_line, right_line):
-    """기존 라인트레이싱 로직 그대로"""
-    global last_target_x
-    h, w = image.shape[:2]
-    car_x = w / 2
-    target_y = int(h * ROI_HEIGHT_RATIO)
+
+def estimate_target_x(image, left_line, right_line, last_x):
+    """기존 로직대로 target_x만 산출"""
+    height, width = image.shape[:2]
 
     if left_line is not None and right_line is not None:
         target_x = (left_line[0][2] + right_line[0][2]) / 2
     elif left_line is not None:
-        target_x = left_line[0][2] + (w * 0.25)
+        target_x = left_line[0][2] + (width * 0.25)
     elif right_line is not None:
-        target_x = right_line[0][2] - (w * 0.25)
+        target_x = right_line[0][2] - (width * 0.25)
     else:
-        target_x = last_target_x
+        target_x = last_x
 
-    last_target_x = target_x
+    return int(target_x)
+
+
+def angle_from_target(image, target_x):
+    height, width = image.shape[:2]
+    car_x = width / 2
+    target_y = int(height * ROI_HEIGHT_RATIO)
     dx = target_x - car_x
-    dy = (h - target_y)
-    angle = math.degrees(math.atan2(dx, abs(dy)))
-    return angle, int(target_x)
+    dy = (height - target_y)
+    return math.degrees(math.atan2(dx, abs(dy)))
 
-def map_servo_from_angle(angle_deg):
+
+def map_servo(angle_deg):
     """
-    angle_deg: 음수=왼쪽, 양수=오른쪽 기준
+    angle_deg: 음수=왼쪽, 양수=오른쪽
+    PWM: left=SERVO_LEFT_MAX, right=SERVO_RIGHT_MAX
     """
     angle_deg = max(-45.0, min(45.0, angle_deg))
     if angle_deg < 0:
@@ -187,121 +166,28 @@ def map_servo_from_angle(angle_deg):
     else:
         return int(SERVO_CENTER + (SERVO_RIGHT_MAX - SERVO_CENTER) * (angle_deg / 45.0))
 
-def line_x_at_y(line, y):
-    if line is None:
-        return None
-    x1, y1, x2, y2 = line[0]
-    if y2 == y1:
-        return None
-    t = (y - y1) / (y2 - y1)
-    return x1 + t * (x2 - x1)
-
-def estimate_lane_width_px(left_line, right_line, y_ref):
-    xl = line_x_at_y(left_line, y_ref)
-    xr = line_x_at_y(right_line, y_ref)
-    if xl is None or xr is None:
-        return DEFAULT_LANE_W_PX
-    w = abs(xr - xl)
-    return int(clamp(w, 140, 360))
-
 
 # ==========================================
-# [6] LiDAR 장애물 추정
-# ==========================================
-def extract_obstacle_lateral_range(scan, fwd_y_max=1800, ang_limit=35):
-    """
-    전방 포인트를 차량좌표로 변환:
-    x = dist*sin(theta) (좌(-)/우(+))
-    y = dist*cos(theta) (전방(+))
-    """
-    xs = []
-    y_min = 1e9
-
-    for (_, ang, dist) in scan:
-        if not (200 < dist < 3000):
-            continue
-
-        theta = ang
-        if theta > 180:
-            theta -= 360
-        if abs(theta) > ang_limit:
-            continue
-
-        th = math.radians(theta)
-        x = dist * math.sin(th)
-        y = dist * math.cos(th)
-
-        if 0 < y < fwd_y_max:
-            xs.append(x)
-            y_min = min(y_min, y)
-
-    if len(xs) < 10:
-        return False, 0.0, 0.0, 9999.0
-
-    xs.sort()
-    k = max(1, int(len(xs) * 0.1))
-    core = xs[k:len(xs)-k] if len(xs) > 2*k else xs
-    return True, float(min(core)), float(max(core)), float(y_min)
-
-def compute_gaps(obs_xmin, obs_xmax):
-    road_left = -ROAD_W_MM / 2.0
-    road_right = ROAD_W_MM / 2.0
-    gap_left = obs_xmin - road_left
-    gap_right = road_right - obs_xmax
-    left_ok = gap_left >= REQ_GAP_MM
-    right_ok = gap_right >= REQ_GAP_MM
-    return gap_left, gap_right, left_ok, right_ok
-
-def choose_avoid_lane(left_ok, right_ok):
-    """
-    장애물이 차선 중앙 가정:
-    - 양쪽 가능: 왼쪽(1차선) 우선 (우측 실선 침범 리스크 ↓)
-    - 한쪽만 가능: 가능한 쪽
-    - 둘 다 불가: None
-    """
-    if left_ok and right_ok:
-        return 1
-    if left_ok:
-        return 1
-    if right_ok:
-        return 2
-    return None
-
-
-# ==========================================
-# [7] 장애물 회피 상태 머신
-# ==========================================
-FOLLOW = 0
-STOP = 1
-SHIFT = 2
-PASS = 3
-RETURN_STOP = 4
-RETURN_SHIFT = 5
-
-default_lane = 2   # 2차선 시작
-current_lane = 2   # 2: 기본, 1: 왼쪽 회피
-
-avoid_state = FOLLOW
-state_ts = 0.0
-last_switch_ts = 0.0
-
-# 램프용(픽셀 오프셋)
-last_shift_px = 0
-
-
-# ==========================================
-# [8] 메인
+# [4] 메인 실행
 # ==========================================
 def main():
-    global current_l_min, avoid_state, state_ts, last_switch_ts, current_lane, last_shift_px
+    global current_l_min, ratio_ema, last_tune_time, target_x_f
 
     cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
-    cap.set(3, WIDTH)
-    cap.set(4, HEIGHT)
-    cap.set(15, -6)
+    width, height = 640, 480
+
+    cap.set(3, width)
+    cap.set(4, height)
+    cap.set(15, -6)  # 기존 유지
+
+    # ✅ 가능할 때만: 캡쳐 버퍼를 줄여 “과거 프레임” 처리 방지(장치에 따라 무시될 수 있음)
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except:
+        pass
 
     if not cap.isOpened():
-        print("❌ 카메라 오류 (인덱스 1이 아니면 0으로 바꿔보세요)")
+        print("❌ 카메라 오류")
         return
 
     print("\n🚀 3초 후 출발!")
@@ -310,25 +196,17 @@ def main():
         time.sleep(1)
 
     if ser:
-        ser.write(f"D,{SPEED_NORMAL}\n".encode())
+        ser.write(f"D,{MAX_SPEED}\n".encode())
 
     last_serial_time = 0.0
     last_speed_time = 0.0
 
-    # 최신 장애물 정보
-    obs_found = False
-    obs_xmin = obs_xmax = 0.0
-    obs_ymin = 9999.0
-    gap_left = gap_right = 0.0
-    left_ok = right_ok = True
+    # 타겟 유지용(라인 못 잡을 때)
+    last_target_raw = target_x_f
 
     try:
         while True:
-            now = time.time()
-
-            # ---------------------------
-            # (0) Arduino RX 버퍼 비우기
-            # ---------------------------
+            # Arduino RX 비우기
             if ser:
                 try:
                     if ser.in_waiting > 0:
@@ -336,242 +214,155 @@ def main():
                 except:
                     pass
 
-            # ---------------------------
-            # (1) LiDAR: scan 1개 업데이트
-            # ---------------------------
-            if scan_gen is not None:
-                try:
-                    scan = next(scan_gen)
-                    obs_found, obs_xmin, obs_xmax, obs_ymin = extract_obstacle_lateral_range(scan)
-                    if obs_found:
-                        gap_left, gap_right, left_ok, right_ok = compute_gaps(obs_xmin, obs_xmax)
-                    else:
-                        left_ok = right_ok = True
-                except StopIteration:
-                    pass
-                except Exception:
-                    # 라이다 일시 오류 시 이전 값 유지
-                    pass
-
-            # ---------------------------
-            # (2) Camera frame
-            # ---------------------------
             ret, frame = cap.read()
             if not ret:
                 break
 
-            if frame.shape[1] != WIDTH:
-                frame = cv2.resize(frame, (WIDTH, HEIGHT))
-
+            if frame.shape[1] != width:
+                frame = cv2.resize(frame, (width, height))
             h, w = frame.shape[:2]
 
-            # ---------------------------
-            # (3) 전처리 + 마스크
-            # ---------------------------
-            blurred = cv2.medianBlur(frame, BLUR_K)
-            hls = cv2.cvtColor(blurred, cv2.COLOR_BGR2HLS)
-
-            lower_white = np.array([0, current_l_min, 0])
-            upper_white = np.array([179, 255, S_MAX_VAL])
-            mask = cv2.inRange(hls, lower_white, upper_white)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones(MORPH_SIZE, np.uint8))
-
-            # ---------------------------
-            # (4) ROI & Auto-tuning
-            # ---------------------------
+            # -------------------------
+            # (1) ROI 폴리곤
+            # -------------------------
             roi_points = np.array([[
                 (0, h), (w, h),
                 (int(w * ROI_X_RIGHT_RATIO), int(h * ROI_HEIGHT_RATIO)),
                 (int(w * ROI_X_LEFT_RATIO), int(h * ROI_HEIGHT_RATIO))
             ]], dtype=np.int32)
 
-            roi_mask_poly = np.zeros_like(mask)
+            # ROI 마스크(폴리곤)
+            roi_mask_poly = np.zeros((h, w), dtype=np.uint8)
             cv2.fillPoly(roi_mask_poly, [roi_points], 255)
-            roi_pixels = cv2.bitwise_and(mask, roi_mask_poly)
 
-            white_count = cv2.countNonZero(roi_pixels)
+            # -------------------------
+            # (2) 조명 변화 강한 환경용 마스크 생성(퍼센타일 + S + Edge 결합)
+            # -------------------------
+            blurred = cv2.medianBlur(frame, BLUR_K)
+            hls = cv2.cvtColor(blurred, cv2.COLOR_BGR2HLS)
+            H, L, S = cv2.split(hls)
+
+            # ROI 내부 분포로 임계값 결정(퍼센타일)
+            L_roi = L[roi_mask_poly == 255]
+            S_roi = S[roi_mask_poly == 255]
+
+            # 예외 방지
+            if L_roi.size < 50:
+                L_thr = current_l_min
+                S_thr = 30
+            else:
+                L_thr = int(np.percentile(L_roi, 90))  # 상위 10% 밝기 기준
+                S_thr = int(np.percentile(S_roi, 30))  # 하위 30% 기준(너무 낮은 채도 배제)
+
+            # 클램프 + 하한(current_l_min) 반영
+            L_thr = clamp(L_thr, L_THR_MIN, L_THR_MAX)
+            L_thr = max(L_thr, current_l_min)
+            S_thr = clamp(S_thr, S_THR_MIN, S_THR_MAX)
+
+            # Color mask (HLS 기반)
+            color_mask = ((L >= L_thr) & (S >= S_thr)).astype(np.uint8) * 255
+
+            # Edge mask (조명 변화에 비교적 강함)
+            gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (5, 5), 0)
+            edges = cv2.Canny(gray, 50, 150)
+
+            # 결합 (둘 중 하나라도 강하면 후보)
+            mask = cv2.bitwise_or(color_mask, edges)
+
+            # ROI 적용
+            mask = cv2.bitwise_and(mask, roi_mask_poly)
+
+            # 노이즈 정리(OPEN + CLOSE)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones(MORPH_OPEN_SIZE, np.uint8))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones(MORPH_CLOSE_SIZE, np.uint8))
+
+            # -------------------------
+            # (3) ratio 계산(색 마스크 기반으로만 계산하는 게 안정적)
+            # -------------------------
+            roi_pixels_for_ratio = cv2.bitwise_and(color_mask, roi_mask_poly)
+            white_count = cv2.countNonZero(roi_pixels_for_ratio)
             total_area = cv2.contourArea(roi_points) or 1
             ratio = white_count / total_area
 
-            if ratio > TARGET_RATIO_MAX:
-                current_l_min = min(current_l_min + 2, MAX_L_VAL)
-            elif ratio < TARGET_RATIO_MIN:
-                current_l_min = max(current_l_min - 2, MIN_L_VAL)
-
-            # ---------------------------
-            # (5) 라인트레이싱(기본) 계산
-            # ---------------------------
-            edges = cv2.Canny(mask, 50, 150)
-            cropped = region_of_interest(edges, roi_points)
-            lines = cv2.HoughLinesP(cropped, 1, np.pi / 180, 50, minLineLength=40, maxLineGap=100)
-
-            left_line, right_line = average_slope_intercept(frame, lines)
-            base_angle, base_target_x = calculate_steering_angle(frame, left_line, right_line)
-
-            # 차선 폭 추정(픽셀)
-            y_ref = int(h * ROI_HEIGHT_RATIO)
-            lane_w_px = estimate_lane_width_px(left_line, right_line, y_ref)
-            shift_px_goal = int(lane_w_px * SHIFT_RATIO)  # 왼쪽 차선으로 갈 때 목표 오프셋
-
-            # ---------------------------
-            # (6) 장애물 상태 머신(정지 후 회피)
-            # ---------------------------
-            status = "FOLLOW"
-            final_speed = SPEED_NORMAL
-
-            obstacle_logic_on = (scan_gen is not None)  # 라이다 연결되었을 때만
-
-            obstacle_near = obstacle_logic_on and obs_found and (obs_ymin < STOP_TRIGGER_MM)
-            obstacle_clear = (not obstacle_logic_on) or (not obs_found) or (obs_ymin > CLEAR_MM)
-
-            if obstacle_logic_on:
-                if avoid_state == FOLLOW:
-                    if obstacle_near:
-                        avoid_state = STOP
-                        state_ts = now
-                        status = "OBSTACLE -> STOP"
-
-                elif avoid_state == STOP:
-                    final_speed = SPEED_STOP
-                    status = "STOP (BEFORE AVOID)"
-
-                    too_close = obs_found and (obs_ymin < CRASH_GUARD_MM)
-                    can_start_turn = (not obs_found) or (obs_ymin > TURN_SAFE_MM)
-
-                    if too_close:
-                        status = "TOO CLOSE -> HOLD STOP"
-                    elif (now - state_ts >= STOP_BEFORE_AVOID_SEC) and can_start_turn:
-                        next_lane = choose_avoid_lane(left_ok, right_ok)
-                        if next_lane is None:
-                            status = "NO GAP -> HOLD STOP"
-                        else:
-                            if (now - last_switch_ts > SWITCH_COOLDOWN):
-                                current_lane = next_lane
-                                avoid_state = SHIFT
-                                state_ts = now
-                                last_switch_ts = now
-                                status = f"SHIFT -> LANE {current_lane}"
-
-                elif avoid_state == SHIFT:
-                    final_speed = SPEED_SLOW
-                    status = "LANE CHANGE (RAMP)"
-                    if now - state_ts >= LANECHANGE_RAMP_SEC:
-                        avoid_state = PASS
-                        state_ts = now
-                        status = "PASS"
-
-                elif avoid_state == PASS:
-                    final_speed = SPEED_SLOW
-                    status = "PASSING"
-                    # 다음 장애물도 동일하게 정지-회피
-                    if obstacle_near:
-                        avoid_state = STOP
-                        state_ts = now
-                        status = "NEXT OBSTACLE -> STOP"
-                    elif obstacle_clear and current_lane != default_lane:
-                        avoid_state = RETURN_STOP
-                        state_ts = now
-                        status = "RETURN -> STOP"
-
-                elif avoid_state == RETURN_STOP:
-                    final_speed = SPEED_STOP
-                    status = "STOP (BEFORE RETURN)"
-                    if now - state_ts >= STOP_BEFORE_AVOID_SEC:
-                        if now - last_switch_ts > SWITCH_COOLDOWN:
-                            current_lane = default_lane
-                            avoid_state = RETURN_SHIFT
-                            state_ts = now
-                            last_switch_ts = now
-                            status = "RETURN SHIFT"
-
-                elif avoid_state == RETURN_SHIFT:
-                    final_speed = SPEED_SLOW
-                    status = "RETURN (RAMP)"
-                    if now - state_ts >= LANECHANGE_RAMP_SEC:
-                        avoid_state = FOLLOW
-                        state_ts = now
-                        status = "FOLLOW"
-
-            # ---------------------------
-            # (7) 라인트레이싱 기반 목표점 보정(차선 변경 = target_x shift)
-            # ---------------------------
-            # current_lane=2(기본): shift=0
-            # current_lane=1(왼쪽 회피): shift=-shift_px_goal
-            desired_shift = 0
-            if current_lane == 1:
-                desired_shift = -shift_px_goal
-
-            # 램프 상태에서만 부드럽게 shift 변화
-            if avoid_state in (SHIFT, RETURN_SHIFT):
-                alpha = clamp((now - state_ts) / max(1e-3, LANECHANGE_RAMP_SEC), 0.0, 1.0)
-                shift_px = int(last_shift_px + (desired_shift - last_shift_px) * alpha)
+            # ratio EMA
+            if ratio_ema is None:
+                ratio_ema = ratio
             else:
-                shift_px = desired_shift
+                ratio_ema = (1.0 - RATIO_EMA_ALPHA) * ratio_ema + RATIO_EMA_ALPHA * ratio
 
-            # shift 적용
-            target_x = int(base_target_x + shift_px)
-            target_x = clamp(target_x, 0, w - 1)
+            # ✅ Auto tuning은 0.2초마다, 변화폭도 1씩만
+            now = time.time()
+            if now - last_tune_time >= TUNE_PERIOD_SEC:
+                if ratio_ema > TARGET_RATIO_MAX:
+                    current_l_min = min(current_l_min + 1, MAX_L_VAL)
+                elif ratio_ema < TARGET_RATIO_MIN:
+                    current_l_min = max(current_l_min - 1, MIN_L_VAL)
+                last_tune_time = now
 
-            # shift 갱신
-            last_shift_px = shift_px
+            # -------------------------
+            # (4) 라인 검출 + 타겟 추정
+            # -------------------------
+            # 허프 입력은 "mask에서 Canny"로 (결합 마스크 기반)
+            edges2 = cv2.Canny(mask, 50, 150)
+            cropped = region_of_interest(edges2, roi_points)
 
-            # 새 angle 계산(기존 angle을 그대로 쓰면 shift 반영이 약함)
-            # target_x 기준으로 새 steering angle 계산
-            car_x = w / 2
-            dy = (h - y_ref)
-            dx = (target_x - car_x)
-            final_angle = math.degrees(math.atan2(dx, abs(dy)))
+            lines = cv2.HoughLinesP(
+                cropped, 1, np.pi / 180, 50,
+                minLineLength=40, maxLineGap=100
+            )
 
-            # 조향 큰 구간 감속(트랙 이탈 방지)
-            steer_abs = abs(final_angle)
-            if steer_abs > 20:
-                final_speed = min(final_speed, 65)
-            elif steer_abs > 12:
-                final_speed = min(final_speed, 85)
+            left, right = average_slope_intercept(frame, lines)
+            target_raw = estimate_target_x(frame, left, right, last_target_raw)
+            last_target_raw = target_raw
 
-            # ---------------------------
-            # (8) Servo / Speed 송신
-            # ---------------------------
-            servo_val = map_servo_from_angle(final_angle)
+            # ✅ 타겟 저역통과 필터(튐 방지)
+            target_x_f = int((1.0 - TARGET_LPF_ALPHA) * target_x_f + TARGET_LPF_ALPHA * target_raw)
+            target_x_f = clamp(target_x_f, 0, w - 1)
 
+            # 필터 타겟 기준으로 조향각 계산
+            angle = angle_from_target(frame, target_x_f)
+
+            # servo 값 계산
+            servo_val = map_servo(angle)
+
+            # -------------------------
+            # (5) 통신(Heartbeat)
+            # -------------------------
             if ser:
-                if now - last_serial_time > SERIAL_DELAY:
+                curr_time = time.time()
+                if curr_time - last_serial_time > SERIAL_DELAY:
                     ser.write(f"S,{servo_val}\n".encode())
-                    last_serial_time = now
-                if now - last_speed_time > SPEED_REFRESH_DELAY:
-                    ser.write(f"D,{final_speed}\n".encode())
-                    last_speed_time = now
+                    last_serial_time = curr_time
+                if curr_time - last_speed_time > SPEED_REFRESH_DELAY:
+                    ser.write(f"D,{MAX_SPEED}\n".encode())
+                    last_speed_time = curr_time
 
-            # ---------------------------
-            # (9) 디스플레이
-            # ---------------------------
+            # -------------------------
+            # (6) 디스플레이
+            # -------------------------
             mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
             cv2.polylines(mask_bgr, [roi_points], True, (0, 255, 255), 2)
 
-            # base target / shifted target 표시
-            cv2.circle(frame, (int(base_target_x), y_ref), 6, (0, 255, 0), -1)   # 기본 라인트레이싱 타겟(초록)
-            cv2.circle(frame, (int(target_x), y_ref), 10, (0, 0, 255), -1)      # 실제 타겟(빨강)
+            # raw 타겟(초록), filtered 타겟(빨강)
+            y_ref = int(h * ROI_HEIGHT_RATIO)
+            cv2.circle(frame, (int(target_raw), y_ref), 6, (0, 255, 0), -1)
+            cv2.circle(frame, (int(target_x_f), y_ref), 10, (0, 0, 255), -1)
 
             combined = np.hstack((frame, mask_bgr))
 
-            cv2.putText(combined, f"L-Min:{current_l_min} Ratio:{ratio*100:.1f}%",
-                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(combined, f"State:{status} Lane:{current_lane} Shift:{shift_px}px",
-                        (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            cv2.putText(
+                combined,
+                f"L_thr(p90)~{L_thr} S_thr(p30)~{S_thr} | L-min:{current_l_min}",
+                (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2
+            )
+            cv2.putText(
+                combined,
+                f"ratio:{ratio*100:.1f}% ema:{ratio_ema*100:.1f}% | angle:{angle:.1f} servo:{servo_val}",
+                (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2
+            )
 
-            if obstacle_logic_on:
-                if obs_found:
-                    cv2.putText(combined,
-                                f"OBS y:{obs_ymin:.0f} gapL:{gap_left:.0f} gapR:{gap_right:.0f} okL:{left_ok} okR:{right_ok}",
-                                (20, HEIGHT - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-                else:
-                    cv2.putText(combined, "OBS: none", (20, HEIGHT - 20),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-            else:
-                cv2.putText(combined, "LiDAR OFF (line-only)", (20, HEIGHT - 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-
-            cv2.imshow("LineTracing + ObstacleAvoid (Stop-Then-Shift)", combined)
+            cv2.imshow("Robust LineTracing (Percentile+S+Edge+LPF)", combined)
             if cv2.waitKey(1) == ord('q'):
                 break
 
@@ -580,22 +371,15 @@ def main():
 
     finally:
         print("\n🛑 안전 정지")
-        try:
-            if ser:
+        if ser:
+            try:
                 for _ in range(3):
                     ser.write(b"D,0\n")
                     ser.write(f"S,{SERVO_CENTER}\n".encode())
                     time.sleep(0.05)
                 ser.close()
-        except:
-            pass
-
-        try:
-            if lidar:
-                lidar.stop()
-                lidar.disconnect()
-        except:
-            pass
+            except:
+                pass
 
         cap.release()
         cv2.destroyAllWindows()
