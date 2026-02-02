@@ -4,7 +4,12 @@ import math
 import serial
 import time
 from rplidar import RPLidar
-from Function_Library import libCAMERA  # (사용 안 해도 됨, 기존 코드 유지)
+
+'''
+너가 지금 당장 해야 할 튜닝 2개(코드 변경 없이 값만)
+SHIFT_GAIN = 1.2 → 1.6~2.2 추천 (실내 트랙이면 1.8부터)
+TRAFFIC_BOX_* ROI는 반드시 “신호등 하우징만” 들어오게 (지금 오탐 대부분이 이거 때문)
+'''
 
 # ==========================================
 # [1] 환경 및 튜닝 설정  (✅ 단독 라인트레이싱 코드와 동일)
@@ -19,7 +24,7 @@ SPEED_REFRESH_DELAY = 1.0
 CAM_INDEX = 1
 CAM_INDEX_TRAFFIC = 0
 
-MAX_SPEED = 120
+MAX_SPEED = 255
 SERVO_CENTER = 570
 SERVO_LEFT_MAX = 680
 SERVO_RIGHT_MAX = 480
@@ -55,7 +60,7 @@ else:
 LIDAR_PORT = 'COM3'
 
 OBSTACLE_START_DIST = 1000   # mm
-SHIFT_GAIN = 1.2             # px per (mm 부족분)
+SHIFT_GAIN = 2.0             # px per (mm 부족분)
 OBSTACLE_CLEAR_TIME = 1.5
 
 # ==========================================
@@ -157,29 +162,26 @@ def average_slope_intercept(image, lines):
             if x1 == x2:
                 continue
 
-            # ✅ 점선(짧은 조각) 제거: 좌/우 상관없이 공통 적용
+            # ✅ [추가] 점선(짧은 선분) 제거
             length = math.hypot(x2 - x1, y2 - y1)
-            if length < 80:   # 60~110 튜닝 (점선 제거 목적)
+            if length < 60:   # 50~80 튜닝. 점선 제거 목적
                 continue
 
             fit = np.polyfit((x1, x2), (y1, y2), 1)
-            # ✅ 너무 수평에 가까운 건 차선이 아닐 확률 큼 (점선/잡음)
-            if abs(slope) < 0.55:
-                continue
-
             slope = fit[0]
             intercept = fit[1]
 
-            # 기울기 필터는 기존 유지
             if slope < -0.5:
                 left_fit.append((slope, intercept))
             elif slope > 0.5:
+                # ✅ [추가] 오른쪽 점선은 더 엄격하게
+                if length < 90:
+                    continue
                 right_fit.append((slope, intercept))
 
     left_line = make_points(image, np.mean(left_fit, axis=0)) if len(left_fit) > 0 else None
     right_line = make_points(image, np.mean(right_fit, axis=0)) if len(right_fit) > 0 else None
     return left_line, right_line
-
 
 def calculate_steering_angle(image, left_line, right_line):
     global last_target_x
@@ -201,6 +203,16 @@ def calculate_steering_angle(image, left_line, right_line):
     dy = (height - target_y)
     return math.degrees(math.atan2(dx, abs(dy))), int(target_x)
 
+"""
+원인: HoughLinesP에서 점선이 잘게 검출되며, 평균화 과정에서 오른쪽 라인이 “안정적인 차선”처럼 들어옴.
+즉, 짧은 선분(점선) 제거가 필요함.
+
+✅ 해결(최소 수정):
+
+average_slope_intercept()에서 line 길이(minLen) 필터 추가 (짧은 선분은 무시)
+
+그리고 “오른쪽 라인”은 점선이 많으므로 오른쪽만 더 엄격하게 길이 필터를 적용(최소 변경이면서 효과 큼)
+"""
 
 def map_value(x, in_min, in_max, out_min, out_max):
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
@@ -313,8 +325,22 @@ def detect_traffic_lr_robust(frame_bgr):
 
     c = max(contours, key=cv2.contourArea)
     area = cv2.contourArea(c)
+
+    # ✅ [추가] 너무 작은 노이즈 제거
     if area < 30:
         return "NONE", {"box": (x1, y1, x2, y2), "mode": "FALLBACK_SMALL", "thr": thr, "area": area,
+                        "red_left": red_left_ratio, "green_right": green_right_ratio}
+
+    # ✅ [추가] 너무 큰 하이라이트(창/기둥) 제거: ROI 면적 대비 과도하면 무시
+    roi_area = float(rh * rw)
+    if area > roi_area * 0.25:  # 0.15~0.35 튜닝
+        return "NONE", {"box": (x1, y1, x2, y2), "mode": "FALLBACK_TOO_BIG", "thr": thr, "area": area,
+                        "red_left": red_left_ratio, "green_right": green_right_ratio}
+
+    # ✅ [추가] 가로로 긴 하이라이트 제거(창 반사 등)
+    x, y, ww, hh = cv2.boundingRect(c)
+    if ww > hh * 2.5:  # 2.0~3.5 튜닝
+        return "NONE", {"box": (x1, y1, x2, y2), "mode": "FALLBACK_WIDE", "thr": thr, "area": area,
                         "red_left": red_left_ratio, "green_right": green_right_ratio}
 
     M = cv2.moments(c)
@@ -364,7 +390,12 @@ def calculate_avoid_angle(image, left_line, right_line, obstacle_dist, last_angl
 
     if direction != 0:
         calc_dist = min(obstacle_dist, OBSTACLE_START_DIST)
-        shift_amount = (OBSTACLE_START_DIST - calc_dist) * SHIFT_GAIN
+        # ✅ [수정] 가까워질수록 shift가 급격히 커지게(비선형)
+        # 900~700mm에서부터 shift가 더 빨리 커짐 → “피하는게 느리고 아슬아슬” 개선
+        # 원하면 1.25를 1.35로 올리면 더 공격적으로 회피합니다.
+        d = max(0.0, float(OBSTACLE_START_DIST - calc_dist))
+        shift_amount = (d ** 1.25) * (SHIFT_GAIN / (OBSTACLE_START_DIST ** 0.25))
+
         if direction == -1:
             final_target = base_target - shift_amount
         elif direction == 1:
@@ -587,8 +618,13 @@ try:
                 crosswalk_detect_timer = 0
 
         # 추가 감속 (정지 중 아닐 때)
-        if raw_dist < 800 and not is_crosswalk_stop:
-            final_speed = min(final_speed, 120)
+        # ✅ [수정] 장애물 있으면 무조건 감속(정지 중 제외), 거리 기반으로 더 줄임
+        if (raw_dist < OBSTACLE_START_DIST) and (not is_crosswalk_stop):
+            # 1000mm -> 160, 600mm -> 120, 400mm -> 90 정도로 떨어지게(튜닝 가능)
+            slow = int(map_value(max(300, min(OBSTACLE_START_DIST, raw_dist)),
+                                 300, OBSTACLE_START_DIST,
+                                 90, 160))
+            final_speed = min(final_speed, slow)
 
         # (8) 통신 (Heartbeat)
         if ser:
