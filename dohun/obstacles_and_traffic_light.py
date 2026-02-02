@@ -19,7 +19,7 @@ CAM_IDX_LANE = 1        # 차선 카메라 번호
 
 # --- 통신 설정 ---
 SERIAL_DELAY = 0.05
-SPEED_REFRESH_DELAY = 0.5  # 속도 갱신 주기 (기존 1.0초 -> 0.5초로 단축)
+SPEED_REFRESH_DELAY = 0.5  # 속도 갱신 주기
 
 # --- 속도 & 모터 설정 ---
 SPEED_NORMAL = 100
@@ -40,27 +40,32 @@ ROI_LANE_X_LEFT = 0.3125
 ROI_LANE_X_RIGHT = 0.6875
 
 # --- 횡단보도 설정 ---
-CROSSWALK_RATIO_MIN = 0.08  # 흰색 비율 기준 완화 (기존 0.12 -> 0.08)
-CROSSWALK_MAX_WAIT = 10.0   # 최대 대기 시간 (기존 7초 -> 10초)
+CROSSWALK_RATIO_MIN = 0.08  
+CROSSWALK_MAX_WAIT = 10.0   
 CROSSWALK_COOLDOWN = 5.0
-CROSSWALK_CONFIRM_TIME = 0.05 # 감지 후 정지까지 확인 시간 (기존 0.2초 -> 0.05초로 즉각 반응)
+CROSSWALK_CONFIRM_TIME = 0.05 
 
 # --- 자동 튜닝 설정 ---
 TARGET_RATIO_MIN = 0.03
 TARGET_RATIO_MAX = 0.10
 
 print("\n" + "=" * 40)
+
+# ★ [수정 1] 노출값 변수 초기화 (오류 방지)
+traffic_exp_value = -7 # 기본값
+lane_exp_value = -7    # ★ 차선 카메라도 -4 -> -7로 변경 (하얀 화면 해결용)
+
 if IS_SUNNY:
     print("   ☀️  현재 모드: SUNNY (햇빛 강함) ☀️")
-    # 신호등용 노출값 (매우 어둡게)
-    TRAFFIC_EXPOSURE = -9 
+    traffic_exp_value = -9  # 신호등 더 어둡게
+    lane_exp_value = -8     # 차선도 더 어둡게
     
     current_l_min = 200; MIN_L_VAL = 150; MAX_L_VAL = 240
     S_MAX = 50; MORPH_SIZE = (5, 5); BLUR_K = 7
 else:
     print("   🌙  현재 모드: NORMAL (실내/흐림) 🌙")
-    # 신호등용 노출값 (어둡게)
-    TRAFFIC_EXPOSURE = -7 
+    traffic_exp_value = -7  # 신호등 어둡게
+    lane_exp_value = -7     # ★ 차선 수정됨 (기존 -4는 너무 밝음)
     
     current_l_min = 140; MIN_L_VAL = 80; MAX_L_VAL = 220
     S_MAX = 80; MORPH_SIZE = (3, 3); BLUR_K = 5
@@ -150,31 +155,23 @@ def map_servo(angle):
     angle = max(-45, min(45, angle))
     return int((angle - (-45)) * (SERVO_RIGHT_MAX - SERVO_LEFT_MAX) / (45 - (-45)) + SERVO_LEFT_MAX)
 
-# ★ [수정됨] 정지선 감지 강화 버전
 def detect_stop_line(mask, frame_to_draw, roi_ratio=0.6):
     h, w = mask.shape[:2]
     roi_h = int(h * roi_ratio)
-    roi = mask[roi_h:h, 0:w] # 화면 하단부 ROI
+    roi = mask[roi_h:h, 0:w] 
     
-    # 1. Canny 감도 조절 (더 낮은 값으로 설정하여 엣지 검출력 높임)
+    # 정지선 감도 설정
     edges = cv2.Canny(roi, 30, 100) 
-    
-    # 2. HoughLinesP 파라미터 완화 (짧은 선, 끊긴 선도 잡도록)
-    # threshold: 15 (약한 선도 인정)
-    # minLineLength: 20 (짧아도 인정)
-    # maxLineGap: 30 (중간에 끊겨도 연결)
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=15, minLineLength=20, maxLineGap=30)
     
     detected = False
     if lines is not None:
         for line in lines:
             x1, y1, x2, y2 = line[0]
-            if x2 - x1 == 0: continue # 수직선 제외
+            if x2 - x1 == 0: continue 
             angle = np.arctan2(y2 - y1, x2 - x1) * 180.0 / np.pi
             
-            # 수평선(0도) 근처인지 확인 (범위 +/- 35도)
             if abs(angle) < 35:
-                # 디버깅용: 감지된 가로선을 빨간색으로 그림
                 cv2.line(frame_to_draw, (x1, y1 + roi_h), (x2, y2 + roi_h), (0, 0, 255), 3)
                 detected = True
     return detected
@@ -191,17 +188,21 @@ try:
     lidar = RPLidar(LIDAR_PORT)
     camera_lib = libCAMERA()
 
-    # [Cam 0] 신호등 카메라 설정 (노출값 중요)
+    # ----------------------------------------
+    # [Cam 0] 신호등 카메라 
+    # ----------------------------------------
     cap_traffic = cv2.VideoCapture(CAM_IDX_TRAFFIC, cv2.CAP_DSHOW)
     cap_traffic.set(3, 640); cap_traffic.set(4, 480);
-    cap_traffic.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25) # 수동 모드 진입 (0.25 or 0.75)
-    cap_traffic.set(cv2.CAP_PROP_EXPOSURE, TRAFFIC_EXPOSURE) # ★ 노출값 적용
+    cap_traffic.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+    cap_traffic.set(cv2.CAP_PROP_EXPOSURE, traffic_exp_value) # ★ 신호등 노출값 적용
 
-    # [Cam 1] 차선 카메라 설정
+    # ----------------------------------------
+    # [Cam 1] 차선 카메라 (수정됨)
+    # ----------------------------------------
     cap_lane = cv2.VideoCapture(CAM_IDX_LANE, cv2.CAP_DSHOW)
     cap_lane.set(3, 640); cap_lane.set(4, 480);
     cap_lane.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-    cap_lane.set(cv2.CAP_PROP_EXPOSURE, -4)
+    cap_lane.set(cv2.CAP_PROP_EXPOSURE, lane_exp_value) # ★ 차선 노출값 적용 (-7)
 
     if not cap_traffic.isOpened() or not cap_lane.isOpened():
         raise Exception("❌ 카메라 연결 실패")
@@ -209,7 +210,8 @@ try:
     fourcc = cv2.VideoWriter_fourcc(*'XVID')
     video_writer = cv2.VideoWriter('final_run.avi', fourcc, 20.0, (1280, 480))
 
-    print("✅ 준비 완료 (3초 대기)")
+    print(f"✅ 설정 완료: Traffic Exp={traffic_exp_value}, Lane Exp={lane_exp_value}")
+    print("✅ 3초 대기...")
     time.sleep(3)
     if ser: ser.write(f"D,{SPEED_NORMAL}\n".encode())
 
@@ -257,16 +259,14 @@ try:
         frame_lane = cv2.resize(frame_lane, (640, 480))
         h, w = frame_lane.shape[:2]
 
-        # 3. [Cam 0] 신호등 (노출을 낮췄으므로 색상 인식 확률 상승)
+        # 3. [Cam 0] 신호등 (매우 어두움)
         traffic_light = camera_lib.object_detection(frame_traffic, sample=3, print_enable=False)
 
-        # 4. [Cam 1] 차선 처리
+        # 4. [Cam 1] 차선 처리 (적당히 어두움 -> 하얀 화면 해결)
         blurred = cv2.medianBlur(frame_lane, BLUR_K)
         hls = cv2.cvtColor(blurred, cv2.COLOR_BGR2HLS)
         mask = cv2.inRange(hls, np.array([0, current_l_min, 0]), np.array([179, 255, S_MAX]))
         
-        # 정지선 인식을 위해 morphology 전의 깨끗한 마스크를 사용할 수도 있으나,
-        # 노이즈 제거를 위해 수행하되, Detect Stop Line 함수 내에서 파라미터를 완화함.
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones(MORPH_SIZE, np.uint8))
         mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
@@ -333,8 +333,7 @@ try:
             else:
                 avoid_direction = 0
 
-        # (C) 횡단보도 및 신호등 로직 (강제성 강화)
-        # 1. 이미 정지 상태
+        # (C) 횡단보도 및 신호등 로직
         if is_crosswalk_stop:
             final_speed = SPEED_STOP
             elapsed = current_time - crosswalk_start_time
@@ -347,10 +346,7 @@ try:
             else:
                 status_msg = f"WAIT GREEN.. ({elapsed:.1f}s)"; status_color = (0, 0, 255)
 
-        # 2. 정지선 감지 시도 (조건 완화: 비율이 조금 낮아도 가로선+RED면 멈춤)
         elif (ratio > CROSSWALK_RATIO_MIN) and (current_time - crosswalk_cooldown_timer > CROSSWALK_COOLDOWN):
-            
-            # 가로선(정지선) 감지 수행
             has_stop_line = detect_stop_line(mask, mask_bgr, ROI_LANE_HEIGHT_RATIO)
             
             if has_stop_line and traffic_light == "RED":
@@ -358,7 +354,6 @@ try:
                     crosswalk_detect_timer = current_time
                     print("🛑 Line + RED Detected. Confirming...")
                 
-                # 확인 시간(0.05초)만 지나면 즉시 정지 (반응 속도 UP)
                 elif current_time - crosswalk_detect_timer > CROSSWALK_CONFIRM_TIME:
                     is_crosswalk_stop = True
                     crosswalk_start_time = current_time
@@ -394,17 +389,16 @@ try:
                                                                   last_valid_angle, avoid_direction)
         last_valid_angle = final_angle
 
-        # 7. 아두이노 명령 전송 (중요: 정지 시 딜레이 무시)
+        # 7. 아두이노 명령 전송
         if ser:
             if current_time - last_serial_time > SERIAL_DELAY:
                 pwm_cmd = map_servo(final_angle)
                 ser.write(f"S,{pwm_cmd}\n".encode())
                 last_serial_time = current_time
             
-            # ★ 수정: 정지 상태(SPEED_STOP)이거나 긴급 상황이면 딜레이 무시하고 즉시 전송
             if final_speed == 0:
                 ser.write(f"D,0\n".encode())
-                last_speed_time = current_time # 타이머 갱신
+                last_speed_time = current_time
             elif current_time - last_speed_time > SPEED_REFRESH_DELAY:
                 ser.write(f"D,{final_speed}\n".encode())
                 last_speed_time = current_time
@@ -421,9 +415,8 @@ try:
         cv2.putText(mask_bgr, f"L-Min:{current_l_min} ({tuning_msg})", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
         cv2.putText(mask_bgr, status_msg, (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
 
-        # 디버깅 창 띄우기
-        cv2.imshow("Traffic View", frame_traffic) # 신호등 노출 확인용
-        cv2.imshow("Lane View", mask_bgr)         # 정지선(빨간 가로선) 확인용
+        cv2.imshow("Traffic View", frame_traffic) 
+        cv2.imshow("Lane View", mask_bgr)         
 
         if video_writer is not None: video_writer.write(mask_bgr)
         if cv2.waitKey(1) == ord('q'): break
