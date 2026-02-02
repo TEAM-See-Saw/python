@@ -7,14 +7,14 @@ import cv2
 # ==========================================================
 # [0] PORT / BAUD
 # ==========================================================
-PORT = "COM4"  # 아두이노 포트
-LIDAR_PORT = "COM3"  # 라이다 포트
+PORT = "COM4"       # 아두이노 포트
+LIDAR_PORT = "COM3" # 라이다 포트
 BAUD = 115200
 
 # ==========================================================
 # [1] SPEED / SERVO
 # ==========================================================
-SPEED_SEARCH = 65  # 센서 싱크를 위해 속도 안정화
+SPEED_SEARCH = 65
 SPEED_SETUP = 60
 SPEED_PARK = 65
 SPEED_EXIT = 65
@@ -28,14 +28,21 @@ STEER_WAIT_TIME = 0.5
 # ==========================================================
 # [2] 판단 임계값 (THRESHOLD)
 # ==========================================================
-RIGHT_OCC_TH = 850  # 이보다 작으면 CAR1 (장애물)
-RIGHT_EMPTY_TH = 1000  # [수정] 이보다 크면 GAP (1150->1000 더 빠르게 반응)
+# [보완] CAR1을 더 잘 잡기 위해 OCC 임계값을 약간 완화(현장에 맞게 조정 가능)
+RIGHT_OCC_TH = 1100     # 이보다 작으면 장애물(차/벽)로 간주
+RIGHT_EMPTY_TH = 1150   # 이보다 크면 빈공간(GAP)로 간주
 
-CAR2_RF_TH = 950  # GAP 주행 중 CAR2 감지 거리
+CAR2_RF_TH = 950        # GAP 주행 중 전방(우전방) CAR2 감지 거리
 
-# [수정] 상태 점프(Skipping) 방지용 최소 시간
-GAP_MIN_TIME = 0.8  # GAP 진입 후 0.8초간 무조건 전진
-SETUP_MIN_TIME = 0.6  # SETUP 회전 후 0.6초간 무조건 전진
+# [Skipping 방지]
+GAP_MIN_TIME = 0.8
+SETUP_MIN_TIME = 0.6
+
+# ==========================================================
+# [2-1] 디바운싱(연속 프레임 확정)
+# ==========================================================
+CAR_OCC_N = 3       # CAR1 확정: 연속 3프레임 장애물
+CAR_EMPTY_N = 4     # GAP 확정: 연속 4프레임 빈공간
 
 # ==========================================================
 # [3] 주차 제어
@@ -65,30 +72,36 @@ IDX_RT = 5
 US_VALID_MIN = 50
 US_VALID_MAX = 5000
 
-
 def valid_us(d):
     return (d is not None) and (US_VALID_MIN <= d <= US_VALID_MAX)
-
 
 # ==========================================================
 # LiDAR Helper
 # ==========================================================
-def get_lidar_dist_in_sector(scan, ang_min, ang_max, invalid=9999, percentile=30):
+def get_lidar_dist_in_sector(scan, ang_min, ang_max, invalid=9999, percentile=20):
+    """
+    percentile를 20으로 기본 설정(하위 분위수) -> 장애물 '놓침' 줄이는 방향
+    """
     dists = []
     for m in scan:
-        if len(m) != 3: continue
+        if len(m) != 3:
+            continue
         _, angle, dist = m
-        if dist <= 0: continue
+        if dist <= 0:
+            continue
+
         if ang_min <= ang_max:
             in_range = (ang_min <= angle <= ang_max)
         else:
             in_range = (angle >= ang_min or angle <= ang_max)
+
         if in_range:
             dists.append(dist)
+
     if not dists:
         return invalid
-    return float(np.percentile(dists, percentile))
 
+    return float(np.percentile(dists, percentile))
 
 def flush_lidar(iterator, count=5):
     """상태 전환 시 구형 데이터 삭제"""
@@ -98,19 +111,19 @@ def flush_lidar(iterator, count=5):
     except:
         pass
 
-
 # ==========================================================
 # SERIAL Helper
 # ==========================================================
 ser = None
 lidar = None
 
-
 def read_sensors():
     global sonar_data, ser
-    if ser is None: return
-    for _ in range(10):  # 버퍼 비우며 최신값 읽기
-        if ser.in_waiting <= 0: break
+    if ser is None:
+        return
+    for _ in range(10):
+        if ser.in_waiting <= 0:
+            break
         try:
             line = ser.readline().decode("utf-8", errors="ignore").strip()
             if line.startswith("US:"):
@@ -120,7 +133,6 @@ def read_sensors():
         except:
             pass
 
-
 def send_cmd(servo, speed):
     global ser
     try:
@@ -129,18 +141,16 @@ def send_cmd(servo, speed):
     except:
         pass
 
-
 def smooth_brake(from_speed, steps=5, dt=0.05):
-    if ser is None: return
+    if ser is None:
+        return
     for s in np.linspace(from_speed, 0, steps):
         send_cmd(SERVO_CENTER, int(s))
         time.sleep(dt)
     send_cmd(SERVO_CENTER, 0)
 
-
 def clamp(v, vmin, vmax):
     return max(vmin, min(vmax, v))
-
 
 # ==========================================================
 # MAIN
@@ -154,11 +164,9 @@ STATE_WAIT = 4
 STATE_EXIT = 5
 STATE_DONE = 6
 
-
 def main():
     global ser, lidar, sonar_data
 
-    # 윈도우 생성
     cv2.namedWindow("Parking Monitor")
 
     try:
@@ -174,6 +182,10 @@ def main():
     state = STATE_SEARCH
     car1_seen = False
 
+    # [보완] 디바운싱 카운터
+    car_occ_cnt = 0
+    car_empty_cnt = 0
+
     gap_t0 = None
     setup_t0 = None
     rev_t0 = None
@@ -188,8 +200,7 @@ def main():
         while True:
             try:
                 scan = next(scan_iter)
-            except Exception as e:
-                # LiDAR 에러 시 재연결 시도
+            except Exception:
                 scan_iter = lidar.iter_scans()
                 continue
 
@@ -198,12 +209,18 @@ def main():
             # ------------------------------------------------------
             # [센서 값 처리]
             # ------------------------------------------------------
-            rs_right = get_lidar_dist_in_sector(scan, 65, 90, percentile=30)
-            rf_front = get_lidar_dist_in_sector(scan, 15, 40, percentile=30)
+            # 오른쪽은 설치각/차체간섭 때문에 한 섹터만 쓰면 놓칠 수 있어
+            # -> 3섹터(40~60, 60~90, 90~120) 중 가장 가까운 값(min) 사용
+            rs_r1 = get_lidar_dist_in_sector(scan, 40, 60, percentile=20)
+            rs_r2 = get_lidar_dist_in_sector(scan, 60, 90, percentile=20)
+            rs_r3 = get_lidar_dist_in_sector(scan, 90, 120, percentile=20)
+            rs_right = min(rs_r1, rs_r2, rs_r3)
 
-            rf = get_lidar_dist_in_sector(scan, 15, 60, percentile=30)
-            rs = get_lidar_dist_in_sector(scan, 60, 90, percentile=30)
-            rr = get_lidar_dist_in_sector(scan, 90, 130, percentile=30)
+            rf_front = get_lidar_dist_in_sector(scan, 15, 40, percentile=20)
+
+            rf = get_lidar_dist_in_sector(scan, 15, 60, percentile=20)
+            rs = get_lidar_dist_in_sector(scan, 60, 90, percentile=20)
+            rr = get_lidar_dist_in_sector(scan, 90, 130, percentile=20)
             rear_all = get_lidar_dist_in_sector(scan, 90, 270, percentile=20)
             front_center = get_lidar_dist_in_sector(scan, 350, 10, percentile=20)
 
@@ -224,15 +241,28 @@ def main():
                 cmd_speed = SPEED_SEARCH
                 cmd_servo = SERVO_CENTER
 
-                if (not car1_seen) and rs_ok and (rs_right < RIGHT_OCC_TH):
-                    car1_seen = True
-                    msg = "CAR1 FOUND!"
+                is_occ = rs_ok and (rs_right < RIGHT_OCC_TH)
+                is_empty = rs_ok and (rs_right > RIGHT_EMPTY_TH)
 
-                if car1_seen and rs_ok and (rs_right > RIGHT_EMPTY_TH):
-                    msg = ">> GAP DETECTED!"
-                    state = STATE_GAP
-                    gap_t0 = time.time()
-                    flush_lidar(scan_iter)  # 중요: 버퍼 비우기
+                if not car1_seen:
+                    # CAR1 확정: 연속 N프레임 장애물
+                    car_occ_cnt = car_occ_cnt + 1 if is_occ else 0
+                    if car_occ_cnt >= CAR_OCC_N:
+                        car1_seen = True
+                        msg = f"CAR1 CONFIRMED! (cnt={car_occ_cnt})"
+                        car_empty_cnt = 0
+                else:
+                    # GAP 확정: 연속 N프레임 빈공간
+                    car_empty_cnt = car_empty_cnt + 1 if is_empty else 0
+                    if car_empty_cnt >= CAR_EMPTY_N:
+                        msg = f">> GAP CONFIRMED! (cnt={car_empty_cnt})"
+                        state = STATE_GAP
+                        gap_t0 = time.time()
+                        flush_lidar(scan_iter)
+
+                        # 카운터 리셋
+                        car_occ_cnt = 0
+                        car_empty_cnt = 0
 
             # ======================================================
             # [S1] GAP (CAR2 탐색)
@@ -246,9 +276,13 @@ def main():
                     msg = f"GAP Force Move ({elapsed:.1f}s)"
                 else:
                     msg = "Searching CAR2..."
+                    # 오른쪽이 다시 막히면(빈공간 아님) SEARCH로 복귀
                     if rs_ok and (rs_right < RIGHT_OCC_TH):
                         state = STATE_SEARCH
                         msg = "<< Reset to SEARCH"
+                        # 복귀 시 카운터 초기화
+                        car_occ_cnt = 0
+                        car_empty_cnt = 0
                     elif rf_ok and (rf_front < CAR2_RF_TH):
                         msg = ">> CAR2 DETECTED! STOP."
                         smooth_brake(SPEED_SEARCH)
@@ -288,7 +322,8 @@ def main():
                 msg = "Parking..."
                 err = RS_TARGET - rs
                 servo = SERVO_CENTER - (KP_RS * err)
-                if rr < RR_MIN_SAFE: servo += RR_RELEASE
+                if rr < RR_MIN_SAFE:
+                    servo += RR_RELEASE
 
                 cmd_servo = int(clamp(servo, SERVO_RIGHT_MAX, SERVO_LEFT_MAX))
                 cmd_speed = -SPEED_PARK
@@ -344,13 +379,16 @@ def main():
                 msg = "ALL DONE"
                 send_cmd(cmd_servo, cmd_speed)
 
-            # [터미널 출력 복구]
-            # 현재 상태, 중요 센서값(우측, 우전방, 후방), 현재 메시지 출력
+            # ------------------------------------------------------
+            # [터미널 출력]
+            # ------------------------------------------------------
             st_name = STATE_NAMES[state]
             print(
-                f"[{st_name}] rsR:{int(rs_right)} rfF:{int(rf_front)} | RF:{int(rf)} RS:{int(rs)} RR:{int(rr)} | Rear:{int(rear_all)} | {msg}")
+                f"[{st_name}] rsR:{int(rs_right)} (r1:{int(rs_r1)} r2:{int(rs_r2)} r3:{int(rs_r3)}) "
+                f"rfF:{int(rf_front)} | RF:{int(rf)} RS:{int(rs)} RR:{int(rr)} | Rear:{int(rear_all)} | {msg}"
+            )
 
-            # 안전 정지
+            # 안전 정지(초음파)
             if min(dist_LT, dist_RT) < 120:
                 cmd_speed = 0
                 print("!!! SONAR EMERGENCY STOP !!!")
@@ -358,11 +396,16 @@ def main():
             send_cmd(cmd_servo, cmd_speed)
 
             # OpenCV 표시
-            img = np.zeros((300, 1000, 3), dtype=np.uint8)
-            cv2.putText(img, f"State: {st_name}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-            cv2.putText(img, msg, (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 255), 2)
-            cv2.putText(img, f"rsR:{int(rs_right)} rfF:{int(rf_front)} Rear:{int(rear_all)}", (10, 150),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            img = np.zeros((320, 1050, 3), dtype=np.uint8)
+            cv2.putText(img, f"State: {st_name}", (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            cv2.putText(img, msg, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 255), 2)
+            cv2.putText(img, f"rsR:{int(rs_right)} rfF:{int(rf_front)} Rear:{int(rear_all)}",
+                        (10, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            cv2.putText(img, f"Right sectors: r1(40-60)={int(rs_r1)} r2(60-90)={int(rs_r2)} r3(90-120)={int(rs_r3)}",
+                        (10, 170), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+            cv2.putText(img, f"OCC<{RIGHT_OCC_TH} EMPTY>{RIGHT_EMPTY_TH} | occ_cnt={car_occ_cnt} empty_cnt={car_empty_cnt}",
+                        (10, 205), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+
             cv2.imshow("Parking Monitor", img)
 
             if cv2.waitKey(1) == ord('q'):
@@ -370,12 +413,12 @@ def main():
 
     finally:
         send_cmd(SERVO_CENTER, 0)
-        if ser: ser.close()
+        if ser:
+            ser.close()
         if lidar:
             lidar.stop()
             lidar.disconnect()
         cv2.destroyAllWindows()
-
 
 if __name__ == "__main__":
     main()
