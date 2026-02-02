@@ -5,20 +5,20 @@ import serial
 import time
 
 # ==========================================
-# [1] 환경 및 튜닝 설정 (사용자 지정값 적용됨)
+# [1] 환경 및 튜닝 설정
 # ==========================================
 PORT = 'COM4'
-BAUDRATE = 115200  
+BAUDRATE = 115200
 SERIAL_DELAY = 0.05
 SPEED_REFRESH_DELAY = 1.0
 
-CAM_INDEX = 1      
+CAM_INDEX = 1
 MAX_SPEED = 255
 SERVO_CENTER = 570
 SERVO_LEFT_MAX = 680
 SERVO_RIGHT_MAX = 480
 
-ROI_HEIGHT_RATIO = 0.5  
+ROI_HEIGHT_RATIO = 0.5
 
 # 직사각형 ROI (와이드 모드)
 ROI_X_LEFT_RATIO = 0.0
@@ -30,15 +30,15 @@ last_target_x = 320
 TARGET_RATIO_MIN = 0.03
 TARGET_RATIO_MAX = 0.10
 
-# HLS 필터 기준값
-# current_l_min은 아래 main함수에서 자동으로 설정됨
+# HLS 필터 기준값 (초기값은 함수로 계산됨)
+# current_l_min = 160  <-- 이 값은 이제 무시되고 자동 설정됨
 MIN_L_VAL = 80       
 MAX_L_VAL = 220      
 S_MAX_VAL = 80       
 
 # 노이즈 제거 필터값
 MORPH_SIZE = (3, 3)
-BLUR_K = 3           
+BLUR_K = 3
 
 # ==========================================
 # [2] 시리얼 연결
@@ -46,7 +46,7 @@ BLUR_K = 3
 ser = None
 try:
     ser = serial.Serial(PORT, BAUDRATE, timeout=0.1)
-    print(f"✅ {PORT} 포트 연결 성공! (Baudrate: {BAUDRATE})")
+    print(f"✅ {PORT} 포트 연결 성공! (2초 대기)")
     time.sleep(2)
 except Exception as e:
     print(f"❌ 연결 실패: {e}")
@@ -55,43 +55,54 @@ except Exception as e:
 # ==========================================
 # [3] 영상 처리 함수
 # ==========================================
+
+# ★ [핵심] 절대 죽지 않는 '초기 밝기 분석' 함수
 def find_optimal_l_min(cap):
-    """
-    출발 전 화면의 밝기를 분석하여 최적의 L-min 값을 찾아내는 함수
-    """
-    print("🔎 최적의 밝기 값 탐색 중...")
+    print("🔎 출발 전 밝기 분석 중...")
     
-    # 1. 카메라 워밍업
-    for _ in range(15):
-        cap.read()
-    
-    # 2. 분석용 프레임 읽기
-    ret, frame = cap.read()
-    if not ret: return 140 # 실패 시 기본값
+    try:
+        # 1. 카메라 워밍업 (20프레임 동안 빛 적응 대기)
+        for i in range(20):
+            ret, _ = cap.read()
+            if not ret:
+                time.sleep(0.05) # 읽기 실패 시 잠깐 대기
 
-    # 3. 전처리 (블러 + HLS)
-    blurred = cv2.medianBlur(frame, BLUR_K)
-    hls = cv2.cvtColor(blurred, cv2.COLOR_BGR2HLS)
-    l_channel = hls[:, :, 1] # 밝기 채널만 추출
+        # 2. 분석용 프레임 진짜로 읽기
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            print("⚠️ 화면 읽기 실패 -> 기본값(140) 사용")
+            return 140
 
-    # 4. ROI 영역만 잘라내기 (바닥만 분석)
-    h, w = frame.shape[:2]
-    roi_l = l_channel[int(h * ROI_HEIGHT_RATIO):h, :]
+        # 3. 전처리 (메인 루프와 동일한 방식)
+        frame = cv2.resize(frame, (640, 480))
+        blurred = cv2.medianBlur(frame, BLUR_K)
+        hls = cv2.cvtColor(blurred, cv2.COLOR_BGR2HLS)
+        l_channel = hls[:, :, 1] # 밝기(L) 채널만 뽑기
 
-    # 5. 밝기 값 통계 분석
-    pixels = roi_l.flatten() 
-    pixels = np.sort(pixels)
-    
-    # 상위 10% 지점의 밝기 값을 찾음 (흰색 차선)
-    target_idx = int(len(pixels) * 0.90)
-    detected_l = pixels[target_idx]
+        # 4. ROI 영역(바닥)만 잘라내기
+        h, w = frame.shape[:2]
+        roi_l = l_channel[int(h * ROI_HEIGHT_RATIO):h, :]
 
-    # 6. 최적값 설정 (감지된 밝기보다 조금 낮게 잡음)
-    optimal_l = detected_l - 30 
-    final_l = max(MIN_L_VAL, min(optimal_l, MAX_L_VAL))
-    
-    print(f"✅ 분석 완료! 감지된 밝기:{detected_l}, 설정된 L-Min:{final_l}")
-    return int(final_l)
+        # 5. 밝기 통계 분석
+        pixels = roi_l.flatten()      # 1줄로 쫙 펴기
+        pixels = np.sort(pixels)      # 밝은 순서대로 정렬
+        
+        # 바닥에 흰색 차선이 약 5~10% 있다고 가정하고, 상위 10% 지점의 밝기를 찾음
+        target_idx = int(len(pixels) * 0.90)
+        detected_l = pixels[target_idx]
+
+        # 6. 값 설정 (감지된 흰색 밝기보다 30 정도 낮게 잡아서 여유를 둠)
+        optimal_l = detected_l - 30
+        
+        # 7. 안전장치 (너무 어둡거나 밝으면 강제 고정)
+        final_l = max(MIN_L_VAL, min(optimal_l, MAX_L_VAL))
+        
+        print(f"✅ 분석 완료! (감지:{detected_l} -> 설정:{final_l})")
+        return int(final_l)
+
+    except Exception as e:
+        print(f"⚠️ 분석 중 에러 발생({e}) -> 기본값(140) 사용")
+        return 140
 
 
 def region_of_interest(img, vertices):
@@ -122,7 +133,7 @@ def average_slope_intercept(image, lines):
             slope = fit[0]
             intercept = fit[1]
 
-            # 횡단보도 회피: 기울기 0.7 미만 무시
+            # 횡단보도(가로선) 무시
             if abs(slope) < 0.7:
                 continue
 
@@ -165,20 +176,19 @@ def map_value(x, in_min, in_max, out_min, out_max):
 # [4] 메인 실행
 # ==========================================
 def main():
-    # 전역 변수 선언 (자동 튜닝을 위해 필요)
-    global current_l_min 
+    global current_l_min
 
     cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
     width = 640
     height = 480
     cap.set(3, width)
     cap.set(4, height)
-    # cap.set(15, -6) 
 
     if not cap.isOpened(): print("❌ 카메라 오류"); return
 
-    # ★ [추가됨] 출발 전 최적의 밝기 값 탐색 및 설정
+    # ★★★★ 여기서 밝기 분석 함수 호출 ★★★★
     current_l_min = find_optimal_l_min(cap)
+    # ★★★★★★★★★★★★★★★★★★★★★★★★★
 
     print("\n🚀 3초 후 출발!");
     for i in range(3, 0, -1): print(f"{i}.."); time.sleep(1)
@@ -190,14 +200,18 @@ def main():
 
     try:
         while True:
-            if ser: ser.reset_input_buffer()
+            # 시리얼 버퍼 비우기
+            if ser:
+                ser.reset_input_buffer()
 
             ret, frame = cap.read()
             if not ret: break
             if frame.shape[1] != width: frame = cv2.resize(frame, (width, height))
             h, w = frame.shape[:2]
 
+            # ------------------------------------------------
             # 1. 전처리
+            # ------------------------------------------------
             blurred = cv2.medianBlur(frame, BLUR_K)
             hls = cv2.cvtColor(blurred, cv2.COLOR_BGR2HLS)
 
@@ -207,7 +221,9 @@ def main():
 
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones(MORPH_SIZE, np.uint8))
 
-            # 2. ROI 및 자동 튜닝 (주행 중 계속 조절)
+            # ------------------------------------------------
+            # 2. ROI 및 자동 튜닝
+            # ------------------------------------------------
             roi_points = np.array([[
                 (0, h), (w, h),
                 (int(w * ROI_X_RIGHT_RATIO), int(h * ROI_HEIGHT_RATIO)),
@@ -223,13 +239,15 @@ def main():
             if total_area == 0: total_area = 1
             ratio = white_count / total_area
 
-            # ★ 실시간 밝기 조절 (Dynamic Tuning)
+            # 자동 튜닝 (주행 중 미세조정)
             if ratio > TARGET_RATIO_MAX:
                 current_l_min = min(current_l_min + 2, MAX_L_VAL)
             elif ratio < TARGET_RATIO_MIN:
                 current_l_min = max(current_l_min - 2, MIN_L_VAL)
 
-            # 3. 주행 계산 (횡단보도 무시 포함)
+            # ------------------------------------------------
+            # 3. 주행 계산
+            # ------------------------------------------------
             edges = cv2.Canny(mask, 50, 150)
             cropped = region_of_interest(edges, roi_points)
             lines = cv2.HoughLinesP(cropped, 1, np.pi / 180, 50, minLineLength=40, maxLineGap=100)
@@ -239,7 +257,9 @@ def main():
             angle, target = calculate_steering_angle(frame, left, right)
             servo_val = int(map_value(max(-45, min(45, angle)), -45, 45, SERVO_LEFT_MAX, SERVO_RIGHT_MAX))
 
+            # ------------------------------------------------
             # 4. 통신
+            # ------------------------------------------------
             if ser:
                 curr_time = time.time()
                 if curr_time - last_serial_time > SERIAL_DELAY:
@@ -249,8 +269,11 @@ def main():
                     ser.write(f"D,{MAX_SPEED}\n".encode())
                     last_speed_time = curr_time
 
+            # ------------------------------------------------
             # 5. 디스플레이
+            # ------------------------------------------------
             mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+
             cv2.polylines(frame, [roi_points], True, (255, 0, 0), 2)
             cv2.circle(frame, (target, int(h * ROI_HEIGHT_RATIO)), 10, (0, 0, 255), -1)
 
@@ -262,14 +285,16 @@ def main():
                 cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 5)
 
             combined = np.hstack((frame, mask_bgr))
+
             info_text = f"L-Min: {current_l_min} | Ratio: {ratio * 100:.1f}%"
-            
             color = (0, 255, 0)
-            if ratio > TARGET_RATIO_MAX: color = (0, 0, 255)
-            elif ratio < TARGET_RATIO_MIN: color = (0, 255, 255)
+            if ratio > TARGET_RATIO_MAX:
+                color = (0, 0, 255)
+            elif ratio < TARGET_RATIO_MIN:
+                color = (0, 255, 255)
 
             cv2.putText(combined, info_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            cv2.imshow("Final Auto-Calibrated Mode", combined)
+            cv2.imshow("Full Feature Mode", combined)
 
             if cv2.waitKey(1) == ord('q'): break
 
