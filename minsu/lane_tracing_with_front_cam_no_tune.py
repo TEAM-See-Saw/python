@@ -26,7 +26,7 @@ ROI_X_LEFT_RATIO = 0.3125
 ROI_X_RIGHT_RATIO = 0.6875
 
 # --- 오프셋 설정 ---
-STEERING_OFFSET = 0
+STEERING_OFFSET = -2
 
 # --- 필터링 고정값 ---
 L_THRESHOLD = 230
