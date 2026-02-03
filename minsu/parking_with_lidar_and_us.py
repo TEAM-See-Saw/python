@@ -38,7 +38,8 @@ TIME_EXIT_ADJUST = 1.0
 TIME_DELAY_STOP = 0.5
 
 # [센서 기준값]
-JUMP_THRESHOLD = 30
+# JUMP_THRESHOLD = 30 # 초기값
+JUMP_THRESHOLD = 40
 MAX_VALID_DIST = 4000
 SAFETY_DIST_CAR2 = 1200
 SIDE_STOP_DIST = 700  # ★ 이 거리(70cm)가 유일한 주차 정지 기준임!
@@ -66,10 +67,10 @@ STATE_NAMES = {
     STATE_SEARCH: "SEARCHING",
     STATE_SETUP_LEFT: "SETUP MOVE",
     STATE_REVERSE_TURN: "REVERSE TURN",
-    STATE_REVERSE_STRAIGHT: "REVERSE PARKING (SENSING)",
+    STATE_REVERSE_STRAIGHT: "REVERSE PARKING",
     STATE_WAIT_AFTER_PARK: "PARKED",
     STATE_EXIT_TURN: "EXITING (TURN)",
-    STATE_EXIT_STRAIGHT: "EXITING (FULL SPEED)",  # 이름 변경
+    STATE_EXIT_STRAIGHT: "EXITING (FULL SPEED)",
     STATE_PAUSE: "PAUSED"
 }
 
@@ -101,6 +102,18 @@ def get_dist_at_angle(scan, target, pm=10):
     return np.min(dists) if dists else 9999
 
 
+def draw_bar(img, value, max_val, x, y, w, h, color, label):
+    # 배경 바
+    cv2.rectangle(img, (x, y), (x + w, y + h), (50, 50, 50), -1)
+    # 값 바
+    fill_w = int((min(value, max_val) / max_val) * w)
+    cv2.rectangle(img, (x, y), (x + fill_w, y + h), color, -1)
+    # 테두리
+    cv2.rectangle(img, (x, y), (x + w, y + h), (255, 255, 255), 1)
+    # 텍스트
+    cv2.putText(img, f"{label}: {value}", (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+
 def main():
     global ser, lidar
     cv2.namedWindow("Parking Monitor")
@@ -112,7 +125,8 @@ def main():
         time.sleep(1)
         lidar.clean_input()
     except Exception as e:
-        print(f"❌ 오류: {e}"); return
+        print(f"❌ 오류: {e}");
+        return
 
     ser.write(f"S,{SERVO_CENTER}\n".encode());
     ser.write(b"D,0\n");
@@ -141,7 +155,7 @@ def main():
                 lidar_radar = get_lidar_min_dist(scan, 30, 110)
                 dist_90 = get_dist_at_angle(scan, 90, 10)
                 dist_270 = get_dist_at_angle(scan, 270, 10)
-                dist_LT = sonar_data[IDX_LT];
+                dist_LT = sonar_data[IDX_LT]
                 dist_RT = sonar_data[IDX_RT]
 
                 cmd_speed = 0
@@ -177,7 +191,7 @@ def main():
                         diff = lidar_radar - reference_dist
                         if (diff > JUMP_THRESHOLD and lidar_radar < MAX_VALID_DIST) or (lidar_radar < SAFETY_DIST_CAR2):
                             stable_count += 1
-                            if stable_count > 2:
+                            if stable_count > 1:
                                 reference_dist = lidar_radar;
                                 search_step = STEP_FIND_GAP
                                 ser.write(b"D,0\n")
@@ -189,7 +203,7 @@ def main():
                                 stable_count = 0
                         else:
                             if lidar_radar < reference_dist: reference_dist = (reference_dist * 0.7) + (
-                                        lidar_radar * 0.3)
+                                    lidar_radar * 0.3)
                             stable_count = 0
                     elif search_step == STEP_FIND_GAP:
                         ser.write(b"D,0\n")
@@ -224,14 +238,13 @@ def main():
                             state_timer = curr_time;
                             side_detect_time = 0
 
-                # ---------------------------------------------------
-                # [4] 마무리 후진 (★ 수정됨: 초음파/시간제한 삭제)
-                # ---------------------------------------------------
+                # [4] 마무리 후진 (로직 유지: 70cm 옆차 감지 시 정지)
                 elif state == STATE_REVERSE_STRAIGHT:
                     # 센터링 로직
-                    if abs(dist_LT - dist_RT) > 50:
+                    center_diff = abs(dist_LT - dist_RT)
+                    if center_diff > 50:
                         target_steer = SERVO_CENTER - CENTERING_POWER if dist_LT < dist_RT else SERVO_CENTER + CENTERING_POWER
-                        msg = "CENTERING..."
+                        msg = f"CENTERING (Diff:{center_diff})"
                     else:
                         target_steer = SERVO_CENTER
                         msg = "CENTERING OK"
@@ -239,13 +252,9 @@ def main():
                     cmd_servo = target_steer
                     cmd_speed = -SPEED_PARK if curr_time - state_timer > STEER_WAIT_TIME else 0
 
-                    # ★ [삭제됨] 초음파(REAR_LIMIT) 정지 로직 삭제
-                    # ★ [삭제됨] 시간제한(5.8초) 정지 로직 삭제
-
-                    # ★ [유일한 정지 조건] 옆 차 감지 (라이다)
                     is_detected = False
                     if dist_90 < SIDE_STOP_DIST or dist_270 < SIDE_STOP_DIST:
-                        msg = "STOP: SIDE CAR"
+                        msg = "STOP: SIDE CAR DETECTED"
                         is_detected = True
 
                     if is_detected:
@@ -260,7 +269,7 @@ def main():
                 # [5] 출차 판단
                 elif state == STATE_WAIT_AFTER_PARK:
                     cmd_speed = 0;
-                    msg = "PARKED"
+                    msg = "PARKED (WAITING)"
                     if curr_time - state_timer > 4.0:
                         state = STATE_EXIT_ADJUST if (dist_90 < 600 or dist_90 < dist_270) else STATE_EXIT_TURN
                         state_timer = curr_time
@@ -282,9 +291,7 @@ def main():
                             state = STATE_EXIT_STRAIGHT;
                             state_timer = curr_time
 
-                # ---------------------------------------------------
-                # [7] 마지막 무한 직진 (★ 수정됨: 속도 255)
-                # ---------------------------------------------------
+                # [7] 마지막 무한 직진
                 elif state == STATE_EXIT_STRAIGHT:
                     drive_time = curr_time - state_timer
                     if drive_time < STEER_WAIT_TIME:
@@ -292,36 +299,94 @@ def main():
                         cmd_servo = SERVO_CENTER;
                         msg = "ALIGNING..."
                     else:
-                        # ★ 여기서 속도를 MAX_SPEED(255)로 변경
                         cmd_speed = MAX_SPEED
-
                         real_drive_time = drive_time - STEER_WAIT_TIME
                         if real_drive_time < 3.3:
                             cmd_servo = SERVO_CENTER + 15;
-                            msg = "KICK LEFT (FULL SPEED)"
+                            msg = f"KICK LEFT ({real_drive_time:.1f}s)"
                         else:
                             cmd_servo = SERVO_CENTER;
-                            msg = "INFINITE RUN (FULL SPEED)"
+                            msg = f"FULL SPEED ({real_drive_time:.1f}s)"
 
-                # [통신 & 디스플레이]
+                # [통신]
                 if curr_time - last_serial_time > SERIAL_DELAY:
                     ser.write(f"S,{cmd_servo}\n".encode());
                     ser.write(f"D,{cmd_speed}\n".encode())
                     last_serial_time = curr_time
 
-                debug_img = np.zeros((200, 400, 3), dtype=np.uint8)
-                cv2.putText(debug_img, f"STATE: {STATE_NAMES.get(state, 'UNKNOWN')}", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                cv2.putText(debug_img, f"MSG: {msg}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                cv2.imshow("Parking Monitor", debug_img)
+                # ----------------------------------------------------------------
+                # ★ [시각화] 상태 모니터링 창 (업그레이드됨)
+                # ----------------------------------------------------------------
+                # 1. 캔버스 생성 (600 x 500)
+                monitor = np.zeros((500, 600, 3), dtype=np.uint8)
+
+                # 2. 헤더 (현재 상태)
+                cv2.putText(monitor, f"STATE: {STATE_NAMES.get(state, 'UNKNOWN')}", (20, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+                cv2.putText(monitor, f"MSG: {msg}", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                # 3. 기본 센서 정보 (LiDAR)
+                cv2.putText(monitor, "--- LIDAR INFO ---", (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                cv2.putText(monitor, f"Front Radar: {int(lidar_radar)}mm", (20, 170), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (255, 255, 255), 1)
+                cv2.putText(monitor, f"Side L(270): {int(dist_270)}mm", (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (255, 255, 255), 1)
+                cv2.putText(monitor, f"Side R(90) : {int(dist_90)}mm", (20, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (255, 255, 255), 1)
+
+                # 4. 상태별 추가 정보
+                cv2.putText(monitor, "--- STATE DETAIL ---", (300, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200),
+                            1)
+                if state == STATE_SEARCH:
+                    cv2.putText(monitor, f"Ref Dist: {int(reference_dist)}", (300, 170), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                (200, 200, 200), 1)
+                    diff_val = lidar_radar - reference_dist if search_step == STEP_PASS_CAR1 else reference_dist - lidar_radar
+                    cv2.putText(monitor, f"Diff: {int(diff_val)}", (300, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                (100, 100, 255), 1)
+                elif state == STATE_REVERSE_STRAIGHT:
+                    cv2.putText(monitor, f"Stop Limit: {SIDE_STOP_DIST}mm", (300, 170), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                (0, 0, 255), 1)
+                    # 센터링 상태 표시
+                    center_color = (0, 255, 0) if abs(dist_LT - dist_RT) <= 50 else (0, 0, 255)
+                    cv2.putText(monitor, f"Centering: {'GOOD' if abs(dist_LT - dist_RT) <= 50 else 'BAD'}",
+                                (300, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.6, center_color, 2)
+
+                # 5. 서보/모터 상태
+                cv2.rectangle(monitor, (20, 260), (580, 310), (30, 30, 30), -1)
+                cv2.putText(monitor, f"Servo: {cmd_servo} | Speed: {cmd_speed}", (40, 295), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7, (255, 255, 0), 2)
+
+                # 6. ★ 후방 초음파 실시간 시각화 (LT / RT)
+                # 게이지 바 그리기 (최대 1000mm 기준)
+                cv2.putText(monitor, "--- REAR ULTRASONIC (LT/RT) ---", (20, 350), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (200, 200, 200), 1)
+
+                # 균형 상태에 따라 색상 변경 (5cm 이상 차이나면 빨간색)
+                bar_color = (0, 255, 0)  # 초록색
+                if abs(dist_LT - dist_RT) > 50:
+                    bar_color = (0, 0, 255)  # 빨간색 (불균형)
+
+                # LT 게이지 (왼쪽)
+                draw_bar(monitor, dist_LT, 1000, 50, 370, 200, 30, bar_color, "LT")
+
+                # RT 게이지 (오른쪽)
+                draw_bar(monitor, dist_RT, 1000, 350, 370, 200, 30, bar_color, "RT")
+
+                # 중앙 차이값 표시
+                diff_text = f"Diff: {abs(dist_LT - dist_RT)}mm"
+                cv2.putText(monitor, diff_text, (220, 440), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+                cv2.imshow("Parking Monitor", monitor)
                 if cv2.waitKey(1) == ord('q'): break
 
         except RPLidarException:
-            lidar.clean_input(); continue
+            lidar.clean_input();
+            continue
         except KeyboardInterrupt:
             break
         except Exception as e:
-            print(f"Err: {e}"); break
+            print(f"Err: {e}");
+            break
 
     if ser: ser.write(b"D,0\n"); ser.close()
     if lidar: lidar.stop(); lidar.disconnect()
