@@ -9,7 +9,7 @@ from rplidar import RPLidar
 # [0] ✅ 속도 정책: BASE_SPEED만 바꾸면 자동 연동
 # ==========================================
 BASE_SPEED = 120            # ✅ 여기만 바꾸면 됨 (기본 크루즈 속도)
-MIN_CORNER_SPEED = 100      # ✅ 코너 감속은 최소 100 이상
+MIN_CORNER_SPEED = 120      # ✅ 코너 감속은 최소 100 이상
 
 def _clamp_int(v, lo, hi):
     return int(max(lo, min(hi, round(v))))
@@ -96,7 +96,7 @@ TARGET_RATIO_MAX = 0.10
 
 if IS_SUNNY:
     print("☀️ 모드: SUNNY")
-    current_l_min = 200
+    current_l_min = 230
     MIN_L_VAL = 150
     MAX_L_VAL = 240
     S_MAX_VAL = 50
