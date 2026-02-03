@@ -6,7 +6,7 @@ import cv2
 
 from common_lane_base import (
     PORT, BAUDRATE, SERIAL_DELAY, SPEED_REFRESH_DELAY,
-    CAM_INDEX, MAX_SPEED, width, height,  # ❌ width/height는 common에 없으므로 아래에서 정의
+    CAM_INDEX, MAX_SPEED  # ❌ width/height는 common에 없으므로 아래에서 정의
 )
 
 from common_lane_base import (
