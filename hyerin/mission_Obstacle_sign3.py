@@ -6,7 +6,7 @@ import time
 from rplidar import RPLidar
 
 # ==========================================
-# [1] 통합 설정 (요청대로: 튜닝값/로직 유지)
+# [1] 통합 설정 (요청대로: 튜닝값/로직 유지 + 단계별 장애물 거리 + 2차선 유지)
 # ==========================================
 PORT = 'COM4'
 BAUDRATE = 115200
@@ -20,7 +20,7 @@ MAX_SPEED = 255
 
 SERVO_CENTER = 570
 SERVO_LEFT_MAX = 680
-SERVO_RIGHT_MAX = 480  # (너 통합 코드에서 쓰던 값 유지)
+SERVO_RIGHT_MAX = 480  # (통합 코드 값 유지)
 
 ROI_HEIGHT_RATIO = 0.6
 ROI_X_LEFT_RATIO = 0.3125
@@ -29,17 +29,37 @@ ROI_X_RIGHT_RATIO = 0.6875
 # ✅ 요청: L_THRESHOLD=230 고정 유지
 L_THRESHOLD = 230
 
-# ---- (sunny/normal 분기 제거 후) 영상 전처리 기본값 ----
+# ---- (sunny/normal 분기 제거) 전처리 기본값 ----
 BLUR_K = 5
 MORPH_SIZE = (3, 3)
 
 # ==========================================
-# [Lidar / 장애물 회피]
+# [Lidar / 장애물 회피]  ✅ 단계별 트리거 거리 반영
 # ==========================================
 LIDAR_PORT = 'COM3'
-OBSTACLE_START_DIST = 1300   # mm
-SHIFT_GAIN = 2.0             # px per (mm 부족분)
-OBSTACLE_CLEAR_TIME = 1.5
+
+# 1번 장애물: 1.2m 이내면 왼쪽 회피
+OBSTACLE_DIST_STAGE1 = 1200  # mm
+
+# 2번 장애물: 1.0m 이내면 오른쪽 회피
+OBSTACLE_DIST_STAGE2 = 1000  # mm
+
+# shift 크기
+SHIFT_GAIN = 2.0  # px per (mm 부족분)
+
+# clearing 유지 시간(2번 후에 조금 더 오래 유지해서 2차선 복귀 확실히)
+OBSTACLE_CLEAR_TIME_STAGE1 = 1.5
+OBSTACLE_CLEAR_TIME_STAGE2 = 2.2
+
+# ✅ (추가) calculate_avoid_angle 내부에서 참조하는 전역 트리거(초기값)
+OBSTACLE_START_DIST = OBSTACLE_DIST_STAGE1
+
+# ==========================================
+# [2차선 유지(마지막 단계에서 1차선으로 새는 것 방지)]
+# ==========================================
+LANE2_BIAS_RATIO = 0.12
+LANE_BIAS_ONLY_WHEN_BOTH = True
+BOTH_SEEN_HOLD_SEC = 0.6
 
 # ==========================================
 # [횡단보도/정지선]
@@ -59,6 +79,14 @@ TRAFFIC_BOX_Y2 = 0.62
 
 TRAFFIC_HIGHLIGHT_PCTL = 98
 TRAFFIC_TH_MIN = 200
+
+# ==========================================
+# ✅ (추가) "회피 끝난 다음에만" 신호등 인식 켜기
+# - 2번 회피(= obstacle_count>=2) + 클리어링 종료 후 딜레이 지나면 ON
+# ==========================================
+traffic_enabled = False
+TRAFFIC_ENABLE_AFTER_OBS_COUNT = 2
+TRAFFIC_ENABLE_DELAY_AFTER_AVOID = 0.5  # 초 (필요하면 0.3~1.0 튜닝)
 
 # ==========================================
 # [2] 시리얼/라이다/카메라 연결
@@ -99,21 +127,16 @@ if not cap_lane.isOpened():
 if not cap_traffic.isOpened():
     print("❌ 신호등 카메라 오류 (CAM_INDEX_TRAFFIC 확인)")
 
-
 # ==========================================
 # ✅ 카메라 AUTO 설정 (노출/화이트밸런스 등)
-# - "밝기는 모드로 나누지 말고 오토로" 요구 반영
 # ==========================================
 def configure_camera_auto(cap):
-    # DirectShow(OpenCV)에서 흔히 0.75=Auto, 0.25=Manual로 동작하는 경우가 많음
     cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
     cap.set(cv2.CAP_PROP_AUTO_WB, 1)
     cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
 
-
 configure_camera_auto(cap_lane)
 configure_camera_auto(cap_traffic)
-
 
 # ==========================================
 # [3] 공용 함수들
@@ -122,7 +145,6 @@ def region_of_interest(img, vertices):
     mask = np.zeros_like(img)
     cv2.fillPoly(mask, vertices, 255)
     return cv2.bitwise_and(img, mask)
-
 
 def make_points(image, line_parameters):
     if line_parameters is None:
@@ -136,8 +158,7 @@ def make_points(image, line_parameters):
     x2 = int((y2 - intercept) / slope)
     return [[x1, y1, x2, y2]]
 
-
-# ✅ 네 통합 코드에 있던 "점선 제거" 로직 유지 (왼쪽 60, 오른쪽 90)
+# ✅ "점선 제거" 로직 유지 (왼쪽 60, 오른쪽 90)
 def average_slope_intercept(image, lines):
     left_fit = []
     right_fit = []
@@ -168,10 +189,8 @@ def average_slope_intercept(image, lines):
     right_line = make_points(image, np.mean(right_fit, axis=0)) if len(right_fit) > 0 else None
     return left_line, right_line
 
-
 def map_value(x, in_min, in_max, out_min, out_max):
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
-
 
 def detect_stop_line(mask, frame_to_draw, roi_ratio=0.6):
     h, w = mask.shape[:2]
@@ -192,7 +211,6 @@ def detect_stop_line(mask, frame_to_draw, roi_ratio=0.6):
                 cv2.line(frame_to_draw, (x1, y1 + roi_h), (x2, y2 + roi_h), (0, 255, 255), 3)
                 detected = True
     return detected
-
 
 # ==========================================
 # ✅ 신호등 인식: HSV(색) 우선 + 과노출 fallback(밝은 blob 위치)
@@ -217,7 +235,6 @@ def detect_traffic_lr_robust(frame_bgr):
 
     third = max(1, rw // 3)
 
-    # (1) HSV 색 기반
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
     S_GATE = 60
@@ -253,7 +270,6 @@ def detect_traffic_lr_robust(frame_bgr):
         return "RIGHT", {"box": (x1, y1, x2, y2), "mode": "HSV_COLOR",
                          "red_left": red_left_ratio, "green_right": green_right_ratio}
 
-    # (2) fallback: 가장 밝은 blob 위치
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
@@ -300,11 +316,13 @@ def detect_traffic_lr_robust(frame_bgr):
     return state, {"box": (x1, y1, x2, y2), "mode": "BRIGHT_BLOB", "thr": thr,
                    "cx": cx, "area": area, "red_left": red_left_ratio, "green_right": green_right_ratio}
 
+# ==========================================
+# ✅ 장애물 회피 조향 (현서 코드 방식 유지 + 2차선 유지 bias 옵션)
+# ==========================================
+def calculate_avoid_angle(image, left_line, right_line, obstacle_dist, last_angle,
+                         direction, lane_bias_px=0, apply_bias=False):
+    global OBSTACLE_START_DIST
 
-# ==========================================
-# ✅ 장애물 회피 조향 (현서 코드 방식 유지)
-# ==========================================
-def calculate_avoid_angle(image, left_line, right_line, obstacle_dist, last_angle, direction):
     height, width = image.shape[:2]
     car_x = width / 2
     target_y = int(height * ROI_HEIGHT_RATIO)
@@ -321,6 +339,7 @@ def calculate_avoid_angle(image, left_line, right_line, obstacle_dist, last_angl
     final_target = base_target
     shift_amount = 0
 
+    # (A) 회피 방향이 있으면 기존 로직대로 shift 적용
     if direction != 0:
         calc_dist = min(obstacle_dist, OBSTACLE_START_DIST)
         d = max(0.0, float(OBSTACLE_START_DIST - calc_dist))
@@ -331,10 +350,13 @@ def calculate_avoid_angle(image, left_line, right_line, obstacle_dist, last_angl
         elif direction == 1:
             final_target = base_target + shift_amount
 
+    # (C) 2차선 유지 bias: 회피 방향이 없을 때만 적용
+    if direction == 0 and apply_bias and lane_bias_px != 0:
+        final_target = final_target + lane_bias_px
+
     dx = final_target - car_x
     dy = (height - target_y)
     return math.degrees(math.atan2(dx, abs(dy))), int(final_target), int(shift_amount)
-
 
 # ==========================================
 # [4] 메인 루프 변수 (로직 유지)
@@ -354,6 +376,22 @@ last_speed_time = 0.0
 
 last_valid_angle = 0.0
 
+# both-line 감지 기반 lane bias 제어
+both_seen_streak = 0
+last_both_seen_time = 0.0
+
+# "현재 목표 차선": 2차선에서 시작, 1번 회피 후 1차선, 2번 회피 후 다시 2차선
+desired_lane = 2  # 2 또는 1
+
+# ==========================================
+# [보조] 단계별 장애물 트리거 거리/클리어 시간
+# ==========================================
+def get_stage_trigger_and_clear(obstacle_count_now):
+    if obstacle_count_now == 0:
+        return OBSTACLE_DIST_STAGE1, OBSTACLE_CLEAR_TIME_STAGE1
+    if obstacle_count_now == 1:
+        return OBSTACLE_DIST_STAGE2, OBSTACLE_CLEAR_TIME_STAGE2
+    return OBSTACLE_DIST_STAGE2, OBSTACLE_CLEAR_TIME_STAGE2
 
 # ==========================================
 # [5] 실행
@@ -377,7 +415,9 @@ try:
 
         current_time = time.time()
 
-        # (1) 라이다 전방 거리
+        # ==========================================
+        # (1) 라이다 전방 거리(raw_dist)
+        # ==========================================
         raw_dist = 2000
         if scan is not None:
             for (_, ang, dist) in scan:
@@ -386,7 +426,9 @@ try:
                         if dist < raw_dist:
                             raw_dist = dist
 
+        # ==========================================
         # (2) 카메라 읽기
+        # ==========================================
         ret_l, frame_lane = cap_lane.read()
         ret_t, frame_traffic = cap_traffic.read()
         if not ret_l or not ret_t:
@@ -400,10 +442,9 @@ try:
 
         h, w = frame_lane.shape[:2]
 
-        # (3) 신호등 판정 (개선 버전 유지)
-        traffic_state, tdbg = detect_traffic_lr_robust(frame_traffic)
-
-        # (4) 차선 마스크 (✅ L_THRESHOLD=230 고정 유지)
+        # ==========================================
+        # (4) 차선 마스크 (✅ L_THRESHOLD=230 고정)
+        # ==========================================
         blurred = cv2.medianBlur(frame_lane, BLUR_K)
         hls = cv2.cvtColor(blurred, cv2.COLOR_BGR2HLS)
 
@@ -415,7 +456,6 @@ try:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones(MORPH_SIZE, np.uint8))
         mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
-        # ROI
         roi_points = np.array([[
             (0, h), (w, h),
             (int(w * ROI_X_RIGHT_RATIO), int(h * ROI_HEIGHT_RATIO)),
@@ -432,19 +472,33 @@ try:
             total_area = 1
         ratio = white_count / total_area
 
-        # (5) 라인 트레이싱
+        # ==========================================
+        # (5) 라인 트레이싱 (유지)
+        # ==========================================
         edges = cv2.Canny(mask, 50, 150)
         cropped = region_of_interest(edges, roi_points)
         lines = cv2.HoughLinesP(cropped, 1, np.pi / 180, 50, minLineLength=40, maxLineGap=100)
         left, right = average_slope_intercept(frame_lane, lines)
 
-        # ==========================================================
-        # (6) 장애물 회피 로직 (유지)
-        # ==========================================================
+        # both-line 감지 업데이트(2차선 구간 판단용)
+        if left is not None and right is not None:
+            both_seen_streak = min(10, both_seen_streak + 1)
+            last_both_seen_time = current_time
+        else:
+            both_seen_streak = max(0, both_seen_streak - 1)
+
+        # ==========================================
+        # (6) 장애물 회피 로직 (유지 + 단계별 거리)
+        # ==========================================
         status_msg = "NORMAL"
         status_color = (0, 255, 0)
         final_speed = MAX_SPEED
         avoid_direction = 0
+
+        stage_trigger, stage_clear_time = get_stage_trigger_and_clear(obstacle_count)
+
+        # ✅ calculate_avoid_angle에서 쓰는 전역 트리거 갱신(로직 유지 목적)
+        OBSTACLE_START_DIST = stage_trigger
 
         if raw_dist < OBSTACLE_START_DIST:
             obstacle_last_seen_time = current_time
@@ -454,6 +508,12 @@ try:
                     obstacle_count += 1
                     is_obstacle_detected = True
                     print(f"⚠️ 장애물 #{obstacle_count} 감지!")
+
+                    # ✅ 목표 차선 업데이트(시나리오 반영)
+                    if obstacle_count == 1:
+                        desired_lane = 1
+                    elif obstacle_count == 2:
+                        desired_lane = 2
 
             if obstacle_count == 1:
                 avoid_direction = -1
@@ -469,7 +529,7 @@ try:
 
         else:
             if is_obstacle_detected:
-                if current_time - obstacle_last_seen_time < OBSTACLE_CLEAR_TIME:
+                if current_time - obstacle_last_seen_time < stage_clear_time:
                     if obstacle_count == 1:
                         avoid_direction = -1
                     elif obstacle_count == 2:
@@ -487,12 +547,47 @@ try:
         # ✅ 회피/클리어링 중인지 플래그 (정지선 STOP 진입 막는 용도) - 유지
         is_avoiding_now = (avoid_direction != 0) or is_obstacle_detected
 
+        # ==========================================
+        # ✅ (추가) 신호등 인식 활성화 조건 업데이트
+        # - 2번 회피 이후 + 회피가 완전히 끝난 상태 + 딜레이 경과 => traffic_enabled=True
+        # - 회피/클리어링 중에는 traffic 판단 자체를 안 하도록 아래에서 게이트
+        # ==========================================
+        if (not traffic_enabled) and (obstacle_count >= TRAFFIC_ENABLE_AFTER_OBS_COUNT):
+            if (not is_avoiding_now) and ((current_time - obs_clear_finished_time) >= TRAFFIC_ENABLE_DELAY_AFTER_AVOID):
+                traffic_enabled = True
+
+        # ==========================================
+        # (3) 신호등 판정: ✅ 장애물 회피 끝난 뒤에만 켜짐
+        # ==========================================
+        if traffic_enabled and (not is_avoiding_now):
+            traffic_state, tdbg = detect_traffic_lr_robust(frame_traffic)
+        else:
+            traffic_state, tdbg = "NONE", {"mode": "TRAFFIC_DISABLED_OR_AVOIDING", "box": None, "red_left": 0.0, "green_right": 0.0}
+
+        # ==========================================
+        # (6-2) 2차선 유지 bias (마지막 단계에서 1차선으로 새는 것 방지)
+        # ==========================================
+        lane2_bias_px = int(w * LANE2_BIAS_RATIO)
+
+        bias_allowed = True
+        if LANE_BIAS_ONLY_WHEN_BOTH:
+            bias_allowed = (both_seen_streak >= 2) and ((current_time - last_both_seen_time) <= BOTH_SEEN_HOLD_SEC)
+
+        apply_lane_bias = (desired_lane == 2) and (avoid_direction == 0) and (not is_crosswalk_stop) and bias_allowed
+
+        # ==========================================
+        # (6-3) 조향 계산
+        # ==========================================
         eff_dist = raw_dist
         if avoid_direction != 0 and raw_dist > OBSTACLE_START_DIST:
             eff_dist = OBSTACLE_START_DIST / 2
 
         angle, target, shift_px = calculate_avoid_angle(
-            frame_lane, left, right, eff_dist, last_valid_angle, avoid_direction
+            frame_lane, left, right,
+            eff_dist, last_valid_angle,
+            avoid_direction,
+            lane_bias_px=(lane2_bias_px if apply_lane_bias else 0),
+            apply_bias=apply_lane_bias
         )
         last_valid_angle = angle
 
@@ -502,11 +597,10 @@ try:
             SERVO_LEFT_MAX, SERVO_RIGHT_MAX
         ))
 
-        # ==========================================================
+        # ==========================================
         # (7) 정지선 + 신호등(좌/우) 로직 (유지)
-        # - 정지선 + LEFT => 정지
-        # - 정지 중 RIGHT => 출발
-        # ==========================================================
+        # - 회피 중에는 STOP 진입 막기 (유지)
+        # ==========================================
         if is_crosswalk_stop:
             final_speed = 0
             elapsed = current_time - crosswalk_start_time
@@ -530,7 +624,6 @@ try:
                 status_color = (0, 0, 255)
 
         else:
-            # ✅ 변경하지 말라 했던 핵심: 회피 중에는 STOP 진입 막기 (유지)
             if (ratio > CROSSWALK_RATIO_MIN) and (current_time - crosswalk_cooldown_timer > CROSSWALK_COOLDOWN) and (not is_avoiding_now):
                 if detect_stop_line(mask, mask_bgr, ROI_HEIGHT_RATIO):
                     if traffic_state == "LEFT":
@@ -555,7 +648,9 @@ try:
             else:
                 crosswalk_detect_timer = 0
 
+        # ==========================================
         # (추가 감속) 장애물 있으면 감속 (유지)
+        # ==========================================
         if (raw_dist < OBSTACLE_START_DIST) and (not is_crosswalk_stop):
             slow = int(map_value(
                 max(300, min(OBSTACLE_START_DIST, raw_dist)),
@@ -564,7 +659,9 @@ try:
             ))
             final_speed = min(final_speed, slow)
 
+        # ==========================================
         # (8) 통신 (Heartbeat)
+        # ==========================================
         if ser:
             if current_time - last_serial_time > SERIAL_DELAY:
                 ser.write(f"S,{servo_val}\n".encode())
@@ -574,8 +671,9 @@ try:
                 ser.write(f"D,{final_speed}\n".encode())
                 last_speed_time = current_time
 
+        # ==========================================
         # (9) 디스플레이
-        # ---- traffic debug ----
+        # ==========================================
         box = tdbg.get("box", None)
         mode = tdbg.get("mode", "-")
         if box is not None:
@@ -589,19 +687,23 @@ try:
         rl = tdbg.get("red_left", 0.0)
         gr = tdbg.get("green_right", 0.0)
         cv2.putText(frame_traffic,
-                    f"Traffic:{traffic_state} mode:{mode} redL:{rl:.3f} greenR:{gr:.3f}",
+                    f"Traffic:{traffic_state} enabled:{traffic_enabled} mode:{mode} redL:{rl:.3f} greenR:{gr:.3f}",
                     (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
 
-        # ---- lane debug ----
         cv2.polylines(mask_bgr, [roi_points], True, (0, 255, 255), 2)
         cv2.circle(mask_bgr, (target, int(h * ROI_HEIGHT_RATIO)), 10, (0, 0, 255), -1)
 
-        cv2.putText(mask_bgr, f"L_TH:{L_THRESHOLD} | Ratio:{ratio*100:.1f}%", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(mask_bgr, f"Angle:{angle:.1f} Target:{target} Shift:{shift_px:.0f}", (20, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
-        cv2.putText(mask_bgr, status_msg, (20, 110),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, status_color, 2)
+        cv2.putText(mask_bgr,
+                    f"L_TH:{L_THRESHOLD} | Ratio:{ratio*100:.1f}% | obs#{obstacle_count} trig:{OBSTACLE_START_DIST}mm",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+
+        cv2.putText(mask_bgr,
+                    f"Angle:{angle:.1f} Target:{target} Shift:{shift_px:.0f} bias:{'ON' if apply_lane_bias else 'OFF'}",
+                    (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 2)
+
+        cv2.putText(mask_bgr,
+                    f"{status_msg} | desired_lane:{desired_lane}",
+                    (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.9, status_color, 2)
 
         combined = np.hstack((frame_traffic, mask_bgr))
         cv2.imshow("Dual View (Traffic + LaneMask)", combined)
