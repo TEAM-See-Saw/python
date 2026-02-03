@@ -103,9 +103,9 @@ def calculate_steering_angle(image, left_line, right_line):
     if left_line is not None and right_line is not None:
         target_x = (left_line[0][2] + right_line[0][2]) / 2
     elif left_line is not None:
-        target_x = left_line[0][2] + (width * 0.25)
+        target_x = left_line[0][2] + (width * 0.4)
     elif right_line is not None:
-        target_x = right_line[0][2] - (width * 0.25)
+        target_x = right_line[0][2] - (width * 0.4)
     else:
         target_x = last_target_x
     last_target_x = target_x
