@@ -6,7 +6,7 @@ import cv2
 
 from common_lane_base import (
     PORT, BAUDRATE, SERIAL_DELAY, SPEED_REFRESH_DELAY,
-    CAM_INDEX, MAX_SPEED,   # ❌ width/height는 common에 없으므로 아래에서 정의
+    CAM_INDEX, MAX_SPEED  # ❌ width/height는 common에 없으므로 아래에서 정의
 )
 
 from common_lane_base import (
@@ -21,7 +21,7 @@ LIDAR_PORT = 'COM3'
 OBSTACLE_DIST_STAGE1 = 1200
 OBSTACLE_DIST_STAGE2 = 1000
 SHIFT_GAIN = 2.0
-OBSTACLE_CLEAR_TIME_STAGE1 = 2.5
+OBSTACLE_CLEAR_TIME_STAGE1 = 1.5
 OBSTACLE_CLEAR_TIME_STAGE2 = 2.2
 
 # 2차선 유지 bias (필요시 그대로 유지)
