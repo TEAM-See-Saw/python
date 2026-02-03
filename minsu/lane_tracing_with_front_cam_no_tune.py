@@ -29,7 +29,8 @@ ROI_X_RIGHT_RATIO = 0.6875
 STEERING_OFFSET = -2
 
 # --- 필터링 고정값 ---
-L_THRESHOLD = 230
+L_THRESHOLD = 170
+# L_THRESHOLD = 230 # 융기원
 
 # ==========================================
 # [2] 시리얼 연결
