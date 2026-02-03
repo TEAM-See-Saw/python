@@ -6,6 +6,70 @@ import time
 from rplidar import RPLidar
 
 # ==========================================
+# [0] ✅ 속도 정책: BASE_SPEED만 바꾸면 자동 연동
+# ==========================================
+BASE_SPEED = 120            # ✅ 여기만 바꾸면 됨 (기본 크루즈 속도)
+MIN_CORNER_SPEED = 100      # ✅ 코너 감속은 최소 100 이상
+
+def _clamp_int(v, lo, hi):
+    return int(max(lo, min(hi, round(v))))
+
+def _cap_corner(v):
+    # 코너(각/각도변화) 감속은 최소 100 보장
+    return int(max(MIN_CORNER_SPEED, v))
+
+def derive_speed_caps(base_speed: int):
+    """
+    base_speed 기준으로 각종 speed cap을 비율로 자동 계산.
+    - 코너 감속(각/각도변화)은 MIN_CORNER_SPEED 이상 보장
+    - 장애물 감속은 안전상 100 밑으로도 가능 (그대로 허용)
+    """
+    base = int(base_speed)
+
+    # --- 장애물 감속(안전 최우선이므로 100 밑도 가능) ---
+    SPEED_CAP_PREP_MAX  = _clamp_int(base * 0.88,  60, base)  # 예: 120 -> 106
+    SPEED_CAP_AVOID_MAX = _clamp_int(base * 0.75,  50, base)  # 예: 120 -> 90
+    SPEED_CAP_CRIT_MAX  = _clamp_int(base * 0.62,  40, base)  # 예: 120 -> 74
+
+    # --- 코너 감속(최소 100 이상 보장) ---
+    CAP_A1 = _cap_corner(_clamp_int(base * 0.92,  0, base))   # 예: 120 -> 110
+    CAP_A2 = _cap_corner(_clamp_int(base * 0.80,  0, base))   # 예: 120 -> 96
+    CAP_A3 = _cap_corner(_clamp_int(base * 0.67,  0, base))   # 예: 120 -> 80 -> 100으로 보정
+
+    CAP_DA1 = _cap_corner(_clamp_int(base * 0.80, 0, base))   # 예: 120 -> 96
+    CAP_DA2 = _cap_corner(_clamp_int(base * 0.67, 0, base))   # 예: 120 -> 80 -> 100 보정
+
+    # --- 차선 신뢰도 낮을 때 감속 (코너는 아니지만 너무 느려지면 불안정할 수 있어 100 보장) ---
+    CAP_LOWCONF = _cap_corner(_clamp_int(base * 0.75, 0, base))  # 예: 120 -> 90 -> 100 보정
+
+    return {
+        "MAX_SPEED": base,
+        "SPEED_CAP_PREP_MAX": SPEED_CAP_PREP_MAX,
+        "SPEED_CAP_AVOID_MAX": SPEED_CAP_AVOID_MAX,
+        "SPEED_CAP_CRIT_MAX": SPEED_CAP_CRIT_MAX,
+        "CAP_A1": CAP_A1, "CAP_A2": CAP_A2, "CAP_A3": CAP_A3,
+        "CAP_DA1": CAP_DA1, "CAP_DA2": CAP_DA2,
+        "CAP_LOWCONF": CAP_LOWCONF,
+    }
+
+_caps = derive_speed_caps(BASE_SPEED)
+
+MAX_SPEED = _caps["MAX_SPEED"]
+
+SPEED_CAP_PREP_MAX  = _caps["SPEED_CAP_PREP_MAX"]
+SPEED_CAP_AVOID_MAX = _caps["SPEED_CAP_AVOID_MAX"]
+SPEED_CAP_CRIT_MAX  = _caps["SPEED_CAP_CRIT_MAX"]
+
+CAP_A1 = _caps["CAP_A1"]
+CAP_A2 = _caps["CAP_A2"]
+CAP_A3 = _caps["CAP_A3"]
+
+CAP_DA1 = _caps["CAP_DA1"]
+CAP_DA2 = _caps["CAP_DA2"]
+
+CAP_LOWCONF = _caps["CAP_LOWCONF"]
+
+# ==========================================
 # [1] 환경 및 튜닝 설정
 # ==========================================
 IS_SUNNY = True
@@ -13,19 +77,15 @@ IS_SUNNY = True
 PORT = 'COM4'
 BAUDRATE = 115200
 SERIAL_DELAY = 0.05
-SPEED_REFRESH_DELAY = 1.0  # (속도 반영 지연 줄이고 싶으면 0.25~0.4로)
+SPEED_REFRESH_DELAY = 1.0
 
 CAM_INDEX = 1
 CAM_INDEX_TRAFFIC = 0
-
-# ✅ 기본(크루즈) 속도 = 120
-MAX_SPEED = 120
 
 SERVO_CENTER = 570
 SERVO_LEFT_MAX = 680
 SERVO_RIGHT_MAX = 480
 
-# ✅ ROI는 그대로 유지 (절대 변경 X)
 ROI_HEIGHT_RATIO = 0.6
 ROI_X_LEFT_RATIO = 0.3125
 ROI_X_RIGHT_RATIO = 0.6875
@@ -81,28 +141,17 @@ LIDAR_FRONT_DEG = 60
 SHIFT_GAIN = 2.1
 
 # ==========================================
-# ✅ [장애물 감속 정책]  (기본 120 기준으로 재조정)
+# ✅ 곡선/조향각 기반 감속 임계(각도 자체는 그대로)
 # ==========================================
-SPEED_CAP_PREP_MAX = 105
-SPEED_CAP_AVOID_MAX = 90
-SPEED_CAP_CRIT_MAX = 75
-
-# ✅ 곡선/조향각 기반 감속 (120 기준)
 ANGLE_SLOW_1 = 14
 ANGLE_SLOW_2 = 20
 ANGLE_SLOW_3 = 28
-CAP_A1 = 110
-CAP_A2 = 95
-CAP_A3 = 80
 
-# ✅ 곡선 진입(각도 변화량) 감속 (120 기준)
+# ✅ 곡선 진입(각도 변화량) 감속 임계
 ANGLE_DDELTA_1 = 6.0
 ANGLE_DDELTA_2 = 10.0
-CAP_DA1 = 95
-CAP_DA2 = 80
 
-# ✅ 차선 신뢰도 낮을 때 감속 (120 기준)
-CAP_LOWCONF = 90
+# ✅ 차선 신뢰도 낮을 때 감속
 LOWCONF_HOLD_FRAMES = 6
 
 # ✅ 서보 레이트 리미트
@@ -156,13 +205,11 @@ height = 480
 
 cap_lane.set(3, width)
 cap_lane.set(4, height)
-# ✅ 노출(Exposure) 강제 설정 제거 → 카메라 자동 노출에 맡김
-# cap_lane.set(15, -6)
+# ✅ 노출 강제 설정 없음 (자동 노출)
 
 cap_traffic.set(3, width)
 cap_traffic.set(4, height)
-# ✅ 노출(Exposure) 강제 설정 제거 → 카메라 자동 노출에 맡김
-# cap_traffic.set(15, -6)
+# ✅ 노출 강제 설정 없음 (자동 노출)
 
 if not cap_lane.isOpened():
     print("❌ 차선 카메라 오류 (CAM_INDEX 확인)")
@@ -244,9 +291,6 @@ def detect_stop_line(mask, frame_to_draw, roi_ratio=0.6):
                 detected = True
     return detected
 
-# ==========================================
-# ✅ 신호등 인식(원본 유지)
-# ==========================================
 def detect_traffic_lr_robust(frame_bgr):
     H, W = frame_bgr.shape[:2]
 
@@ -346,9 +390,6 @@ def detect_traffic_lr_robust(frame_bgr):
     return state, {"box": (x1, y1, x2, y2), "mode": "BRIGHT_BLOB", "thr": thr,
                    "cx": cx, "area": area, "red_left": red_left_ratio, "green_right": green_right_ratio}
 
-# ==========================================
-# ✅ 라이다: 좌/우 전방 섹터 최소거리
-# ==========================================
 def get_front_lr_min_dist(scan, front_deg=60, dist_min=150, dist_max=2500):
     if scan is None:
         return 2000, 2000
@@ -367,14 +408,10 @@ def get_front_lr_min_dist(scan, front_deg=60, dist_min=150, dist_max=2500):
 
     return left_min, right_min
 
-# ==========================================
-# ✅ 우측 실선 품질 평가(right_q)
-# ==========================================
 def clamp01(x):
     return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
 
 prev_right_x_for_q = None
-
 def right_line_quality(right_line, img_w):
     global prev_right_x_for_q
 
@@ -387,16 +424,12 @@ def right_line_quality(right_line, img_w):
     dy = float(y2 - y1)
     length = math.hypot(dx, dy)
 
-    if abs(dx) < 1e-3:
-        slope = 999.0
-    else:
-        slope = dy / dx
-
+    slope = 999.0 if abs(dx) < 1e-3 else (dy / dx)
     xR = float(x2)
 
-    q_len = clamp01((length - 70.0) / (110.0))
+    q_len = clamp01((length - 70.0) / 110.0)
     s = abs(slope)
-    q_slope = clamp01((s - 0.6) / (1.4))
+    q_slope = clamp01((s - 0.6) / 1.4)
 
     if prev_right_x_for_q is None:
         xjump = 0.0
@@ -414,9 +447,6 @@ def right_line_quality(right_line, img_w):
     q = (0.45 * q_len + 0.35 * q_slope + 0.20 * q_jump) * edge_pen
     return float(clamp01(q)), xR, float(slope), float(length), float(xjump)
 
-# ==========================================
-# ✅ 2차선 유지: 우측 실선 앵커 방식(중앙선 점선 무시)
-# ==========================================
 lane_width_px = 260.0
 LANE_W_MIN = 160.0
 LANE_W_MAX = 420.0
@@ -553,7 +583,7 @@ try:
     if ser:
         ser.write(f"D,{MAX_SPEED}\n".encode())
 
-    print("🚀 주행 시작 (노출 자동/기본속도=120)")
+    print(f"🚀 주행 시작 (BASE_SPEED={BASE_SPEED}, 코너 최소={MIN_CORNER_SPEED})")
 
     scan_iter = lidar.iter_scans() if lidar is not None else [None] * 10**9
 
@@ -765,8 +795,8 @@ try:
                 ser.write(f"D,{final_speed}\n".encode())
                 last_speed_time = current_time
 
+        # (디버그 표시는 필요 시 유지/확장)
         box = tdbg.get("box", None)
-        mode = tdbg.get("mode", "-")
         if box is not None:
             x1, y1, x2, y2 = box
             cv2.rectangle(frame_traffic, (x1, y1), (x2, y2), (0, 255, 255), 2)
@@ -781,11 +811,11 @@ try:
         cv2.circle(mask_bgr, (final_target, y_guide), 10, (0, 0, 255), -1)
 
         cv2.putText(mask_bgr,
-                    f"Conf:{lane_conf:.2f} rightQ:{right_q:.2f} rLen:{rq_len:.0f} rJump:{rq_jump:.0f}",
-                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (200, 200, 200), 2)
+                    f"BASE:{BASE_SPEED} caps(A1/A2/A3)={CAP_A1}/{CAP_A2}/{CAP_A3}  obs(P/A/C)={SPEED_CAP_PREP_MAX}/{SPEED_CAP_AVOID_MAX}/{SPEED_CAP_CRIT_MAX}",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 2)
         cv2.putText(mask_bgr,
-                    f"Dist:{raw_dist} L:{left_min} R:{right_min} | Angle:{angle:.1f} Speed:{final_speed} | {status_msg}",
-                    (20, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.70, status_color, 2)
+                    f"Dist:{raw_dist} L:{left_min} R:{right_min} | Angle:{angle:.1f} dA:{dang:.1f} | Speed:{final_speed} | {status_msg}",
+                    (20, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.65, status_color, 2)
 
         combined = np.hstack((frame_traffic, mask_bgr))
         cv2.imshow("Dual View (Traffic + LaneMask)", combined)
