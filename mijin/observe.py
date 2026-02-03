@@ -13,7 +13,7 @@ IS_SUNNY = True
 PORT = 'COM4'
 BAUDRATE = 115200
 SERIAL_DELAY = 0.05
-SPEED_REFRESH_DELAY = 0.4  # (속도 반영 지연 줄이고 싶으면 0.25~0.4로)
+SPEED_REFRESH_DELAY = 1.0  # (속도 반영 지연 줄이고 싶으면 0.25~0.4로)
 
 CAM_INDEX = 1
 CAM_INDEX_TRAFFIC = 0
@@ -83,11 +83,8 @@ SHIFT_GAIN = 2.1
 # ==========================================
 # ✅ [장애물 감속 정책]  (기본 120 기준으로 재조정)
 # ==========================================
-# PREP 구간(<=160cm): 120보다 살짝 낮게
 SPEED_CAP_PREP_MAX = 105
-# AVOID 구간(<=150cm): 더 낮게
 SPEED_CAP_AVOID_MAX = 90
-# CRIT 구간(<=90cm): 안전 최저
 SPEED_CAP_CRIT_MAX = 75
 
 # ✅ 곡선/조향각 기반 감속 (120 기준)
@@ -159,11 +156,13 @@ height = 480
 
 cap_lane.set(3, width)
 cap_lane.set(4, height)
-cap_lane.set(15, -6)
+# ✅ 노출(Exposure) 강제 설정 제거 → 카메라 자동 노출에 맡김
+# cap_lane.set(15, -6)
 
 cap_traffic.set(3, width)
 cap_traffic.set(4, height)
-cap_traffic.set(15, -6)
+# ✅ 노출(Exposure) 강제 설정 제거 → 카메라 자동 노출에 맡김
+# cap_traffic.set(15, -6)
 
 if not cap_lane.isOpened():
     print("❌ 차선 카메라 오류 (CAM_INDEX 확인)")
@@ -473,11 +472,7 @@ def compute_lane2_target_right_anchor(img_w, left_line, right_line, prev_target_
     if abs(step) > TARGET_MAX_STEP:
         smooth = float(prev_target_x) + (TARGET_MAX_STEP if step > 0 else -TARGET_MAX_STEP)
 
-    if right_valid:
-        base_conf = 1.0
-    else:
-        base_conf = max(0.0, 1.0 - (lost_right_count / float(LOWCONF_HOLD_FRAMES)))
-
+    base_conf = 1.0 if right_valid else max(0.0, 1.0 - (lost_right_count / float(LOWCONF_HOLD_FRAMES)))
     lane_conf = clamp01(base_conf * (0.35 + 0.65 * right_q))
 
     return int(smooth), int(xR), int(lane_width_px), int(min_x), int(max_x), float(lane_conf), right_valid
@@ -556,10 +551,9 @@ prev_servo = None
 
 try:
     if ser:
-        # ✅ 시작 기본 속도도 120으로
         ser.write(f"D,{MAX_SPEED}\n".encode())
 
-    print("🚀 주행 시작 (기본속도=120 / 감속 정책 120 기준 재조정)")
+    print("🚀 주행 시작 (노출 자동/기본속도=120)")
 
     scan_iter = lidar.iter_scans() if lidar is not None else [None] * 10**9
 
@@ -573,11 +567,9 @@ try:
 
         current_time = time.time()
 
-        # (1) 라이다 거리
         left_min, right_min = get_front_lr_min_dist(scan, front_deg=LIDAR_FRONT_DEG)
         raw_dist = min(left_min, right_min)
 
-        # (2) 카메라
         ret_l, frame_lane = cap_lane.read()
         ret_t, frame_traffic = cap_traffic.read()
         if not ret_l or not ret_t:
@@ -591,10 +583,8 @@ try:
 
         h, w = frame_lane.shape[:2]
 
-        # (3) 신호등
         traffic_state, tdbg = detect_traffic_lr_robust(frame_traffic)
 
-        # (4) 차선 마스크 (어두움 보완, ROI 불변)
         blurred = cv2.medianBlur(frame_lane, BLUR_K)
         hls = cv2.cvtColor(blurred, cv2.COLOR_BGR2HLS)
 
@@ -653,7 +643,6 @@ try:
 
         current_l_min = int(max(effective_min_l, min(MAX_L_VAL, current_l_min)))
 
-        # (5) 라인 검출
         edges = cv2.Canny(mask, 50, 150)
         cropped = region_of_interest(edges, roi_points)
         lines = cv2.HoughLinesP(cropped, 1, np.pi / 180, 50, minLineLength=40, maxLineGap=100)
@@ -661,13 +650,11 @@ try:
 
         right_q, rq_xR, rq_slope, rq_len, rq_jump = right_line_quality(right, w)
 
-        # (6) 2차선 목표점
         lane2_target, right_x, road_width_px, min_x, max_x, lane_conf, right_valid = compute_lane2_target_right_anchor(
             w, left, right, last_target_x, right_q
         )
         last_target_x = lane2_target
 
-        # (7) 장애물 판단(2차선 장애물만 회피)
         status_msg = "LANE2 HOLD"
         status_color = (0, 255, 0)
 
@@ -699,7 +686,6 @@ try:
                     status_msg = "OBS END -> LANE2 HOLD"
                     status_color = (0, 255, 0)
 
-        # (8) 최종 목표 + 클램프
         final_target, shift_px = apply_obstacle_shift(lane2_target, raw_dist, avoid_direction)
         final_target = max(min_x, min(max_x, final_target))
 
@@ -712,7 +698,6 @@ try:
         servo_val = clamp_servo_rate(raw_servo, prev_servo, SERVO_RATE_LIMIT)
         prev_servo = servo_val
 
-        # (9) ✅ 속도 정책(기본 120에서 cap로만 줄임)
         final_speed = MAX_SPEED
         final_speed = min(final_speed, speed_cap_by_angle(angle_abs))
         final_speed = min(final_speed, speed_cap_by_angle_delta(dang))
@@ -724,7 +709,6 @@ try:
         if avoid_direction != 0:
             final_speed = min(final_speed, SPEED_CAP_AVOID_MAX)
 
-        # (10) 정지선 + 신호등
         if is_crosswalk_stop:
             final_speed = 0
             elapsed = current_time - crosswalk_start_time
@@ -772,7 +756,6 @@ try:
             else:
                 crosswalk_detect_timer = 0
 
-        # (11) 통신
         if ser:
             if current_time - last_serial_time > SERIAL_DELAY:
                 ser.write(f"S,{servo_val}\n".encode())
@@ -782,7 +765,6 @@ try:
                 ser.write(f"D,{final_speed}\n".encode())
                 last_speed_time = current_time
 
-        # (12) 디버그 표시
         box = tdbg.get("box", None)
         mode = tdbg.get("mode", "-")
         if box is not None:
