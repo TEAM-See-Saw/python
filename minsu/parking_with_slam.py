@@ -7,8 +7,8 @@ import cv2
 # ==========================================
 # [1] 설정값
 # ==========================================
-PORT = 'COM4'
-LIDAR_PORT = 'COM3'
+PORT = 'COM5'
+LIDAR_PORT = 'COM6'
 BAUDRATE = 115200
 
 SERIAL_DELAY = 0.05
@@ -33,7 +33,7 @@ STEER_WAIT_TIME = 0.8
 # [시간 설정]
 TIME_SETUP_MOVE = 7.0
 TIME_REVERSE_TURN = 6.5
-TIME_EXIT_TURN = 18.0
+TIME_EXIqT_TURN = 18.0
 TIME_EXIT_ADJUST = 1.0
 TIME_DELAY_STOP = 0.5
 
