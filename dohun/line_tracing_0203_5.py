@@ -7,7 +7,7 @@ import time
 # ==========================================
 # [1] 환경 및 튜닝 설정
 # ==========================================
-IS_SUNNY = True
+IS_SUNNY = False
 
 PORT = 'COM4'
 BAUDRATE = 115200
@@ -20,7 +20,7 @@ SERVO_CENTER = 570
 SERVO_LEFT_MAX = 680
 SERVO_RIGHT_MAX = 480
 
-ROI_HEIGHT_RATIO = 0.5
+ROI_HEIGHT_RATIO = 0.6
 ROI_X_LEFT_RATIO = 0.3125
 ROI_X_RIGHT_RATIO = 0.6875
 

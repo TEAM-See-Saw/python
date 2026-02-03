@@ -3,7 +3,7 @@ import numpy as np
 
 # ===========================
 # [설정] 튜닝할 카메라 번호 설정
-CAM_INDEX = 0
+CAM_INDEX = 1
 
 # [설정] 목표 해상도 (FHD)
 TARGET_W = 1920

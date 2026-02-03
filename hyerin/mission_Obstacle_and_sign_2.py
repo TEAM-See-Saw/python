@@ -4,7 +4,6 @@ import math
 import serial
 import time
 from rplidar import RPLidar
-from Function_Library import libCAMERA  # (사용 안 해도 됨, 기존 코드 유지)
 
 # ==========================================
 # [1] 환경 및 튜닝 설정  (✅ 단독 라인트레이싱 코드와 동일)
@@ -54,8 +53,8 @@ else:
 # ==========================================
 LIDAR_PORT = 'COM3'
 
-OBSTACLE_START_DIST = 1000   # mm
-SHIFT_GAIN = 1.2             # px per (mm 부족분)
+OBSTACLE_START_DIST = 1000  # mm
+SHIFT_GAIN = 1.2  # px per (mm 부족분)
 OBSTACLE_CLEAR_TIME = 1.5
 
 # ==========================================
@@ -68,8 +67,6 @@ CROSSWALK_CONFIRM_TIME = 0.2
 
 # ==========================================
 # ✅ [핵심] 신호등 ROI(박스) 파라미터
-# - "신호등 3구 하우징"만 딱 잡히게 맞춰야 함
-# - 화면에서 박스가 배경(창/벽)을 포함하면 실패함
 # ==========================================
 TRAFFIC_BOX_X1 = 0.22
 TRAFFIC_BOX_X2 = 0.62
@@ -77,11 +74,10 @@ TRAFFIC_BOX_Y1 = 0.35
 TRAFFIC_BOX_Y2 = 0.62
 
 # ==========================================
-# ✅ [핵심] 신호등 인식 파라미터 (과노출 대응)
+# ✅ [핵심] 신호등 인식 파라미터
 # ==========================================
-TRAFFIC_HIGHLIGHT_PCTL = 98     # fallback 밝은 blob threshold percentile (96~99)
-TRAFFIC_TH_MIN = 200            # fallback 최소 threshold
-# HSV gate 튜닝은 함수 내부에서 S_GATE/V_GATE/COLOR_TH로 조정
+TRAFFIC_HIGHLIGHT_PCTL = 98
+TRAFFIC_TH_MIN = 200
 
 # ==========================================
 # [2] 시리얼/라이다/카메라 연결
@@ -124,6 +120,7 @@ if not cap_lane.isOpened():
 if not cap_traffic.isOpened():
     print("❌ 신호등 카메라 오류 (CAM_INDEX_TRAFFIC 확인)")
 
+
 # ==========================================
 # [3] 영상 처리 함수들
 # ==========================================
@@ -157,20 +154,19 @@ def average_slope_intercept(image, lines):
             if x1 == x2:
                 continue
 
-            # ✅ 점선(짧은 조각) 제거: 좌/우 상관없이 공통 적용
             length = math.hypot(x2 - x1, y2 - y1)
-            if length < 80:   # 60~110 튜닝 (점선 제거 목적)
+            if length < 80:
                 continue
 
             fit = np.polyfit((x1, x2), (y1, y2), 1)
-            # ✅ 너무 수평에 가까운 건 차선이 아닐 확률 큼 (점선/잡음)
-            if abs(slope) < 0.55:
-                continue
 
+            # ✅ [수정됨] slope를 조건문 검사 전에 먼저 할당해야 합니다!
             slope = fit[0]
             intercept = fit[1]
 
-            # 기울기 필터는 기존 유지
+            if abs(slope) < 0.55:
+                continue
+
             if slope < -0.5:
                 left_fit.append((slope, intercept))
             elif slope > 0.5:
@@ -228,9 +224,7 @@ def detect_stop_line(mask, frame_to_draw, roi_ratio=0.6):
 
 
 # ==========================================
-# ✅ [핵심] 신호등 인식: HSV(색) 우선 + 과노출 fallback(밝은 blob 위치)
-# - LEFT  => 정지 신호 (빨강/왼쪽램프)
-# - RIGHT => 출발 신호 (초록/오른쪽램프)
+# ✅ 신호등 인식
 # ==========================================
 def detect_traffic_lr_robust(frame_bgr):
     H, W = frame_bgr.shape[:2]
@@ -252,17 +246,16 @@ def detect_traffic_lr_robust(frame_bgr):
 
     third = max(1, rw // 3)
 
-    # ---- (1) HSV color detection with saturation gate ----
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     Hh, Ss, Vv = cv2.split(hsv)
 
-    S_GATE = 60     # 흰색(채도 낮음) 제거 강도. 60~90 튜닝
-    V_GATE = 80     # 어두운 노이즈 제거. 60~120 튜닝
-    COLOR_TH = 0.003  # 색 픽셀 비율 임계. 0.001~0.01 튜닝
+    S_GATE = 60
+    V_GATE = 80
+    COLOR_TH = 0.003
 
     sat_mask = (Ss >= S_GATE).astype(np.uint8) * 255
 
-    red1 = cv2.inRange(hsv, (0,   S_GATE, V_GATE), (10, 255, 255))
+    red1 = cv2.inRange(hsv, (0, S_GATE, V_GATE), (10, 255, 255))
     red2 = cv2.inRange(hsv, (170, S_GATE, V_GATE), (180, 255, 255))
     red_mask = cv2.bitwise_or(red1, red2)
 
@@ -275,9 +268,8 @@ def detect_traffic_lr_robust(frame_bgr):
     red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, k)
     green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, k)
 
-    # LEFT lamp == ROI left third, RIGHT lamp == ROI right third
     red_left = red_mask[:, 0:third]
-    green_right = green_mask[:, 2*third:rw] if (2*third) < rw else green_mask[:, third:rw]
+    green_right = green_mask[:, 2 * third:rw] if (2 * third) < rw else green_mask[:, third:rw]
 
     red_left_ratio = cv2.countNonZero(red_left) / float(red_left.size)
     green_right_ratio = cv2.countNonZero(green_right) / float(green_right.size)
@@ -297,7 +289,6 @@ def detect_traffic_lr_robust(frame_bgr):
             "green_right": green_right_ratio
         }
 
-    # ---- (2) Fallback: brightest blob position ----
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
@@ -322,7 +313,7 @@ def detect_traffic_lr_robust(frame_bgr):
         return "NONE", {"box": (x1, y1, x2, y2), "mode": "FALLBACK_BADMOM", "thr": thr,
                         "red_left": red_left_ratio, "green_right": green_right_ratio}
 
-    cx = int(M["m10"] / M["m00"])  # ROI 내부 x
+    cx = int(M["m10"] / M["m00"])
 
     if cx < third:
         state = "LEFT"
@@ -343,7 +334,7 @@ def detect_traffic_lr_robust(frame_bgr):
 
 
 # ==========================================
-# ✅ [추가] 장애물 회피 조향 함수 (현서 코드 방식)
+# ✅ 장애물 회피 조향 함수
 # ==========================================
 def calculate_avoid_angle(image, left_line, right_line, obstacle_dist, last_angle, direction):
     height, width = image.shape[:2]
@@ -399,7 +390,7 @@ try:
 
     print("🚀 주행 시작")
 
-    scan_iter = lidar.iter_scans() if lidar is not None else [None] * 10**9
+    scan_iter = lidar.iter_scans() if lidar is not None else [None] * 10 ** 9
 
     for scan in scan_iter:
         # (0) 아두이노 버퍼 비우기
@@ -478,7 +469,7 @@ try:
         left, right = average_slope_intercept(frame_lane, lines)
 
         # ==========================================================
-        # (6) 장애물 회피 로직 (현서 코드)
+        # (6) 장애물 회피 로직
         # ==========================================================
         status_msg = "NORMAL"
         status_color = (0, 255, 0)
@@ -535,9 +526,7 @@ try:
         servo_val = int(map_value(max(-45, min(45, angle)), -45, 45, SERVO_LEFT_MAX, SERVO_RIGHT_MAX))
 
         # ==========================================================
-        # (7) 정지선 + 신호등(좌/우) 로직
-        # - 정지선 + LEFT(왼쪽 램프) => 정지
-        # - 정지 중 RIGHT(오른쪽 램프) => 출발
+        # (7) 정지선 + 신호등 로직
         # ==========================================================
         if is_crosswalk_stop:
             final_speed = 0
@@ -608,11 +597,10 @@ try:
             x1, y1, x2, y2 = box
             cv2.rectangle(frame_traffic, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
-            # ROI 내부 3분할 가이드
             rw = x2 - x1
             third = max(1, rw // 3)
             cv2.line(frame_traffic, (x1 + third, y1), (x1 + third, y2), (255, 255, 0), 2)
-            cv2.line(frame_traffic, (x1 + 2*third, y1), (x1 + 2*third, y2), (255, 255, 0), 2)
+            cv2.line(frame_traffic, (x1 + 2 * third, y1), (x1 + 2 * third, y2), (255, 255, 0), 2)
 
         rl = tdbg.get("red_left", 0.0)
         gr = tdbg.get("green_right", 0.0)
@@ -624,7 +612,7 @@ try:
         cv2.polylines(mask_bgr, [roi_points], True, (0, 255, 255), 2)
         cv2.circle(mask_bgr, (target, int(h * ROI_HEIGHT_RATIO)), 10, (0, 0, 255), -1)
 
-        cv2.putText(mask_bgr, f"L-Min:{current_l_min} | Ratio:{ratio*100:.1f}%", (20, 40),
+        cv2.putText(mask_bgr, f"L-Min:{current_l_min} | Ratio:{ratio * 100:.1f}%", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(mask_bgr, f"Angle:{angle:.1f} Target:{target} Shift:{shift_px:.0f}", (20, 70),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)

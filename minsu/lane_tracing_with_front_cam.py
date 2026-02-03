@@ -5,7 +5,7 @@ import serial
 import time
 
 # ==========================================
-# [1] 환경 및 튜닝 설정
+# [1] 설정값
 # ==========================================
 IS_SUNNY = True
 
@@ -15,15 +15,24 @@ SERIAL_DELAY = 0.05
 SPEED_REFRESH_DELAY = 1.0
 
 CAM_INDEX = 1
-MAX_SPEED = 255
+MAX_SPEED = 255  # 속도 조절
+
+# --- 서보 모터 설정 ---
 SERVO_CENTER = 570
 SERVO_LEFT_MAX = 680
-SERVO_RIGHT_MAX = 480
+SERVO_RIGHT_MAX = 440
 
-ROI_HEIGHT_RATIO = 0.6
+# --- ROI 설정 ---
+ROI_HEIGHT_RATIO = 0.5
 ROI_X_LEFT_RATIO = 0.3125
 ROI_X_RIGHT_RATIO = 0.6875
 
+# --- ★ [핵심] 조향 오프셋 설정 ★ ---
+# 좌회전 시 안쪽(왼쪽) 차선을 밟는다면 양수(+) 값을 주어 타겟을 오른쪽으로 밉니다.
+# 반대로 우회전 시 안쪽을 밟으면 음수(-) 값을 줍니다.
+STEERING_OFFSET = 20
+
+# --- 자동 튜닝 설정 ---
 last_target_x = 320
 TARGET_RATIO_MIN = 0.03
 TARGET_RATIO_MAX = 0.10
@@ -81,15 +90,26 @@ def average_slope_intercept(image, lines):
     left_fit = [];
     right_fit = []
     if lines is None: return None, None
+
     for line in lines:
         for x1, y1, x2, y2 in line:
+            if x1 == x2: continue
+
+            # 짧은 선(점선/노이즈) 제거
+            if math.hypot(x2 - x1, y2 - y1) < 80: continue
+
             fit = np.polyfit((x1, x2), (y1, y2), 1)
-            slope = fit[0];
+            slope = fit[0]
             intercept = fit[1]
+
+            # 수평선 제거 (기울기가 너무 완만하면 무시)
+            if abs(slope) < 0.55: continue
+
             if slope < -0.5:
                 left_fit.append((slope, intercept))
             elif slope > 0.5:
                 right_fit.append((slope, intercept))
+
     left_line = make_points(image, np.mean(left_fit, axis=0)) if len(left_fit) > 0 else None
     right_line = make_points(image, np.mean(right_fit, axis=0)) if len(right_fit) > 0 else None
     return left_line, right_line
@@ -100,6 +120,7 @@ def calculate_steering_angle(image, left_line, right_line):
     height, width = image.shape[:2]
     car_x = width / 2
     target_y = int(height * ROI_HEIGHT_RATIO)
+
     if left_line is not None and right_line is not None:
         target_x = (left_line[0][2] + right_line[0][2]) / 2
     elif left_line is not None:
@@ -108,14 +129,22 @@ def calculate_steering_angle(image, left_line, right_line):
         target_x = right_line[0][2] - (width * 0.25)
     else:
         target_x = last_target_x
+
+    # ★ [핵심] 오프셋 적용 (차를 오른쪽으로 밀어줌)
+    target_x = target_x + STEERING_OFFSET
+
+    # 화면 밖으로 나가지 않게 제한 (안전장치)
+    target_x = max(0, min(width, target_x))
+
     last_target_x = target_x
     dx = target_x - car_x
     dy = (height - target_y)
     return math.degrees(math.atan2(dx, abs(dy))), int(target_x)
 
 
-def map_value(x, in_min, in_max, out_min, out_max):
-    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+def map_servo(angle):
+    # 각도(-45~45)를 서보 PWM(680~440)으로 변환
+    return int((angle - (-45)) * (SERVO_RIGHT_MAX - SERVO_LEFT_MAX) / (45 - (-45)) + SERVO_LEFT_MAX)
 
 
 # ==========================================
@@ -128,11 +157,13 @@ def main():
     height = 480
     cap.set(3, width);
     cap.set(4, height);
-    cap.set(15, -6)
+    cap.set(15, -6)  # 노출값 조절
 
     if not cap.isOpened(): print("❌ 카메라 오류"); return
     print("\n🚀 3초 후 출발!");
     for i in range(3, 0, -1): print(f"{i}.."); time.sleep(1)
+
+    # 출발 명령
     if ser: ser.write(f"D,{MAX_SPEED}\n".encode())
 
     last_serial_time = 0
@@ -140,11 +171,10 @@ def main():
 
     try:
         while True:
-            # 아두이노 데이터 비우기 (버퍼 오버플로우 방지)
+            # 아두이노 데이터 버퍼 비우기 (필수)
             if ser:
                 try:
-                    if ser.in_waiting > 0:
-                        ser.read(ser.in_waiting)
+                    if ser.in_waiting > 0: ser.read(ser.in_waiting)
                 except:
                     pass
 
@@ -153,9 +183,10 @@ def main():
             if frame.shape[1] != width: frame = cv2.resize(frame, (width, height))
             h, w = frame.shape[:2]
 
-            # 1. 전처리
+            # 1. 전처리 (Blur -> HLS -> Mask)
             blurred = cv2.medianBlur(frame, BLUR_K)
             hls = cv2.cvtColor(blurred, cv2.COLOR_BGR2HLS)
+
             lower_white = np.array([0, current_l_min, 0])
             upper_white = np.array([179, 255, S_MAX_VAL])
             mask = cv2.inRange(hls, lower_white, upper_white)
@@ -167,15 +198,15 @@ def main():
                 (int(w * ROI_X_RIGHT_RATIO), int(h * ROI_HEIGHT_RATIO)),
                 (int(w * ROI_X_LEFT_RATIO), int(h * ROI_HEIGHT_RATIO))
             ]], dtype=np.int32)
+
             roi_mask_poly = np.zeros_like(mask)
             cv2.fillPoly(roi_mask_poly, [roi_points], 255)
             roi_pixels = cv2.bitwise_and(mask, roi_mask_poly)
 
             white_count = cv2.countNonZero(roi_pixels)
-            total_area = cv2.contourArea(roi_points)
-            if total_area == 0: total_area = 1
-            ratio = white_count / total_area
+            ratio = white_count / cv2.contourArea(roi_points) if cv2.contourArea(roi_points) > 0 else 0
 
+            # 밝기 자동 조절
             if ratio > TARGET_RATIO_MAX:
                 current_l_min = min(current_l_min + 2, MAX_L_VAL)
             elif ratio < TARGET_RATIO_MIN:
@@ -185,9 +216,12 @@ def main():
             edges = cv2.Canny(mask, 50, 150)
             cropped = region_of_interest(edges, roi_points)
             lines = cv2.HoughLinesP(cropped, 1, np.pi / 180, 50, minLineLength=40, maxLineGap=100)
+
             left, right = average_slope_intercept(frame, lines)
+
+            # ★ 오프셋이 적용된 조향각 계산
             angle, target = calculate_steering_angle(frame, left, right)
-            servo_val = int(map_value(max(-45, min(45, angle)), -45, 45, SERVO_LEFT_MAX, SERVO_RIGHT_MAX))
+            servo_val = map_servo(max(-45, min(45, angle)))
 
             # 4. 통신 (Heartbeat)
             if ser:
@@ -199,24 +233,20 @@ def main():
                     ser.write(f"D,{MAX_SPEED}\n".encode())
                     last_speed_time = curr_time
 
-            # 5. 디스플레이 (수정된 부분)
-            # 마스크 컬러 변환
+            # 5. 디스플레이
             mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            cv2.polylines(mask_bgr, [roi_points], True, (0, 255, 255), 2)  # ROI 노란색
 
-            # ROI 박스 그리기 (마스크 화면에 노란색으로)
-            cv2.polylines(mask_bgr, [roi_points], True, (0, 255, 255), 2)
-
-            # 타겟 포인트 그리기 (원본 화면에 빨간색 점)
+            # 타겟 포인트 (오프셋 적용된 위치)
             cv2.circle(frame, (target, int(h * ROI_HEIGHT_RATIO)), 10, (0, 0, 255), -1)
 
-            # 화면 합치기
             combined = np.hstack((frame, mask_bgr))
+            cv2.putText(combined, f"Offset: {STEERING_OFFSET}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255),
+                        2)
+            cv2.putText(combined, f"Angle: {angle:.1f}  Servo: {servo_val}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                        (0, 255, 0), 2)
 
-            # 텍스트 출력
-            cv2.putText(combined, f"L-Min: {current_l_min} | Ratio: {ratio * 100:.1f}%", (20, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-            cv2.imshow("HLS + ROI Visualized (Auto)", combined)
+            cv2.imshow("Pure Lane Tracing + Offset", combined)
             if cv2.waitKey(1) == ord('q'): break
 
     except Exception as e:

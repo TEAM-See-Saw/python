@@ -5,9 +5,8 @@ import serial
 import time
 
 # ==========================================
-# [1] 환경 및 튜닝 설정
+# [1] 설정값
 # ==========================================
-IS_SUNNY = True
 PORT = 'COM4'
 BAUDRATE = 115200
 SERIAL_DELAY = 0.05
@@ -15,34 +14,22 @@ SPEED_REFRESH_DELAY = 1.0
 
 CAM_INDEX = 1
 MAX_SPEED = 255
+
+# --- 서보 모터 설정 ---
 SERVO_CENTER = 570
 SERVO_LEFT_MAX = 680
-SERVO_RIGHT_MAX = 480
+SERVO_RIGHT_MAX = 440
 
+# --- ROI 설정 ---
 ROI_HEIGHT_RATIO = 0.6
 ROI_X_LEFT_RATIO = 0.3125
 ROI_X_RIGHT_RATIO = 0.6875
 
-last_target_x = 320
-TARGET_RATIO_MIN = 0.03
-TARGET_RATIO_MAX = 0.10
+# --- 오프셋 설정 ---
+STEERING_OFFSET = 0
 
-if IS_SUNNY:
-    print("☀️ 모드: SUNNY")
-    current_l_min = 200;
-    MIN_L_VAL = 150;
-    MAX_L_VAL = 240
-    S_MAX_VAL = 50;
-    MORPH_SIZE = (5, 5);
-    BLUR_K = 7
-else:
-    print("🌙 모드: NORMAL")
-    current_l_min = 150;
-    MIN_L_VAL = 80;
-    MAX_L_VAL = 220
-    S_MAX_VAL = 80;
-    MORPH_SIZE = (3, 3);
-    BLUR_K = 5
+# --- 필터링 고정값 ---
+L_THRESHOLD = 230
 
 # ==========================================
 # [2] 시리얼 연결
@@ -80,18 +67,30 @@ def average_slope_intercept(image, lines):
     left_fit = [];
     right_fit = []
     if lines is None: return None, None
+
     for line in lines:
         for x1, y1, x2, y2 in line:
+            if x1 == x2: continue
+            if math.hypot(x2 - x1, y2 - y1) < 80: continue
+
             fit = np.polyfit((x1, x2), (y1, y2), 1)
             slope = fit[0];
             intercept = fit[1]
+
+            if abs(slope) < 0.55: continue
+
             if slope < -0.5:
                 left_fit.append((slope, intercept))
             elif slope > 0.5:
                 right_fit.append((slope, intercept))
+
     left_line = make_points(image, np.mean(left_fit, axis=0)) if len(left_fit) > 0 else None
     right_line = make_points(image, np.mean(right_fit, axis=0)) if len(right_fit) > 0 else None
     return left_line, right_line
+
+
+# last_target_x 변수는 더 이상 필요 없지만 호환성을 위해 남겨둠 (사용 안 함)
+last_target_x = 320
 
 
 def calculate_steering_angle(image, left_line, right_line):
@@ -99,39 +98,58 @@ def calculate_steering_angle(image, left_line, right_line):
     height, width = image.shape[:2]
     car_x = width / 2
     target_y = int(height * ROI_HEIGHT_RATIO)
+
     if left_line is not None and right_line is not None:
-        target_x = (left_line[0][2] + right_line[0][2]) / 2
+        # 양쪽 다 보임 -> 중간 지점
+        base_target_x = (left_line[0][2] + right_line[0][2]) / 2
     elif left_line is not None:
-        target_x = left_line[0][2] + (width * 0.25)
+        # 왼쪽만 보임 -> 왼쪽 + 차폭 절반
+        base_target_x = left_line[0][2] + (width * 0.25)
     elif right_line is not None:
-        target_x = right_line[0][2] - (width * 0.25)
+        # 오른쪽만 보임 -> 오른쪽 - 차폭 절반
+        base_target_x = right_line[0][2] - (width * 0.25)
     else:
-        target_x = last_target_x
-    last_target_x = target_x
-    dx = target_x - car_x
+        # ★ [수정] 차선 못 찾으면 무조건 중앙(직진)으로 복귀
+        # 기존: base_target_x = last_target_x
+        base_target_x = width / 2  # 중앙
+
+    # 값 저장 (다음 프레임에 쓰진 않지만 변수 업데이트용)
+    last_target_x = base_target_x
+
+    # 오프셋 적용
+    final_target_x = base_target_x + STEERING_OFFSET
+    final_target_x = max(0, min(width, final_target_x))
+
+    dx = final_target_x - car_x
     dy = (height - target_y)
-    return math.degrees(math.atan2(dx, abs(dy))), int(target_x)
+
+    return math.degrees(math.atan2(dx, abs(dy))), int(final_target_x)
 
 
-def map_value(x, in_min, in_max, out_min, out_max):
-    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+def map_servo(angle):
+    return int((angle - (-45)) * (SERVO_RIGHT_MAX - SERVO_LEFT_MAX) / (45 - (-45)) + SERVO_LEFT_MAX)
 
 
 # ==========================================
 # [4] 메인 실행
 # ==========================================
 def main():
-    global current_l_min
     cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
     width = 640;
     height = 480
     cap.set(3, width);
-    cap.set(4, height);
-    cap.set(15, -9)
+    cap.set(4, height)
+    # cap.set(15, -6)
 
     if not cap.isOpened(): print("❌ 카메라 오류"); return
+
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    out = cv2.VideoWriter('lane_record.avi', fourcc, 20.0, (1280, 480))
+    print("🎥 녹화 시작: lane_record.avi")
+
     print("\n🚀 3초 후 출발!");
     for i in range(3, 0, -1): print(f"{i}.."); time.sleep(1)
+
     if ser: ser.write(f"D,{MAX_SPEED}\n".encode())
 
     last_serial_time = 0
@@ -139,11 +157,9 @@ def main():
 
     try:
         while True:
-            # 아두이노 데이터 비우기 (버퍼 오버플로우 방지)
             if ser:
                 try:
-                    if ser.in_waiting > 0:
-                        ser.read(ser.in_waiting)
+                    if ser.in_waiting > 0: ser.read(ser.in_waiting)
                 except:
                     pass
 
@@ -152,43 +168,28 @@ def main():
             if frame.shape[1] != width: frame = cv2.resize(frame, (width, height))
             h, w = frame.shape[:2]
 
-            # 1. 전처리
-            blurred = cv2.medianBlur(frame, BLUR_K)
+            # 필터링
+            blurred = cv2.medianBlur(frame, 5)
             hls = cv2.cvtColor(blurred, cv2.COLOR_BGR2HLS)
-            lower_white = np.array([0, current_l_min, 0])
-            upper_white = np.array([179, 255, S_MAX_VAL])
-            mask = cv2.inRange(hls, lower_white, upper_white)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones(MORPH_SIZE, np.uint8))
+            mask = cv2.inRange(hls, np.array([0, L_THRESHOLD, 0]), np.array([179, 255, 255]))
 
-            # 2. ROI & Auto Tuning
+            # 차선 인식
+            edges = cv2.Canny(mask, 50, 150)
             roi_points = np.array([[
                 (0, h), (w, h),
                 (int(w * ROI_X_RIGHT_RATIO), int(h * ROI_HEIGHT_RATIO)),
                 (int(w * ROI_X_LEFT_RATIO), int(h * ROI_HEIGHT_RATIO))
             ]], dtype=np.int32)
-            roi_mask_poly = np.zeros_like(mask)
-            cv2.fillPoly(roi_mask_poly, [roi_points], 255)
-            roi_pixels = cv2.bitwise_and(mask, roi_mask_poly)
-
-            white_count = cv2.countNonZero(roi_pixels)
-            total_area = cv2.contourArea(roi_points)
-            if total_area == 0: total_area = 1
-            ratio = white_count / total_area
-
-            if ratio > TARGET_RATIO_MAX:
-                current_l_min = min(current_l_min + 2, MAX_L_VAL)
-            elif ratio < TARGET_RATIO_MIN:
-                current_l_min = max(current_l_min - 2, MIN_L_VAL)
-
-            # 3. 주행 계산
-            edges = cv2.Canny(mask, 50, 150)
             cropped = region_of_interest(edges, roi_points)
+
             lines = cv2.HoughLinesP(cropped, 1, np.pi / 180, 50, minLineLength=40, maxLineGap=100)
             left, right = average_slope_intercept(frame, lines)
-            angle, target = calculate_steering_angle(frame, left, right)
-            servo_val = int(map_value(max(-45, min(45, angle)), -45, 45, SERVO_LEFT_MAX, SERVO_RIGHT_MAX))
 
-            # 4. 통신 (Heartbeat)
+            # ★ 조향 계산 (놓치면 중앙)
+            angle, target = calculate_steering_angle(frame, left, right)
+            servo_val = map_servo(max(-45, min(45, angle)))
+
+            # 통신
             if ser:
                 curr_time = time.time()
                 if curr_time - last_serial_time > SERIAL_DELAY:
@@ -198,35 +199,33 @@ def main():
                     ser.write(f"D,{MAX_SPEED}\n".encode())
                     last_speed_time = curr_time
 
-            # 5. 디스플레이 (수정된 부분)
-            # 마스크 컬러 변환
+            # 디스플레이
             mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-
-            # ROI 박스 그리기 (마스크 화면에 노란색으로)
             cv2.polylines(mask_bgr, [roi_points], True, (0, 255, 255), 2)
-
-            # 타겟 포인트 그리기 (원본 화면에 빨간색 점)
             cv2.circle(frame, (target, int(h * ROI_HEIGHT_RATIO)), 10, (0, 0, 255), -1)
 
-            # 화면 합치기
             combined = np.hstack((frame, mask_bgr))
+            cv2.putText(combined, f"Angle: {angle:.1f} Offset: {STEERING_OFFSET}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, (0, 255, 0), 2)
 
-            # 텍스트 출력
-            cv2.putText(combined, f"L-Min: {current_l_min} | Ratio: {ratio * 100:.1f}%", (20, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            out.write(combined)
 
-            cv2.imshow("HLS + ROI Visualized (Auto)", combined)
+            cv2.imshow("Auto Exposure Lane Tracing", combined)
             if cv2.waitKey(1) == ord('q'): break
 
     except Exception as e:
         print(f"❌ 오류 발생: {e}")
 
     finally:
-        print("\n🛑 안전 정지")
+        print("\n🛑 안전 정지 & 녹화 저장 완료")
         if ser:
             for _ in range(3): ser.write(b"D,0\n"); ser.write(b"S,570\n"); time.sleep(0.05)
             ser.close()
-        cap.release();
+
+        if 'out' in locals() and out.isOpened():
+            out.release()
+
+        cap.release()
         cv2.destroyAllWindows()
 
 

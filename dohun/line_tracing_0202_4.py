@@ -2,6 +2,7 @@ import numpy as np
 import math
 import serial
 import time
+import cv2
 
 # ==========================================
 # [1] 환경 및 튜닝 설정
