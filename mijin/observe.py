@@ -1,139 +1,112 @@
-# run_obstacle_avoid.py
-import serial
+# run_obstacle_only_merged.py
+# - Camera/ROI: 1번 코드(common_lane_base) 방식 그대로
+# - Obstacle state/trigger/clear: 2번 코드 방식 그대로(단일 임계값 + clear time)
+# - Traffic/crosswalk: 전부 제거
+# - Lane tracing: 1번 코드 방식(base_target_from_lines + (desired_lane==2) bias + both-line gate)
+# - Shift(회피 이동량): 2번 코드 방식(선형) 적용
+
 import time
-from rplidar import RPLidar
+import serial
 import cv2
+from rplidar import RPLidar
 
 from common_lane_base import (
     PORT, BAUDRATE, SERIAL_DELAY, SPEED_REFRESH_DELAY,
-    CAM_INDEX,
+    CAM_INDEX, MAX_SPEED,
     configure_camera_auto, compute_lane, base_target_from_lines,
     angle_from_target, servo_from_angle,
     ROI_HEIGHT_RATIO,
 )
 
-# =========================================================
-# [1] 장애물 회피 설정 (✅ "더 빨리 시작" + ✅ "피하는 시간은 그대로")
-# =========================================================
+# ===== 장애물 회피 설정 (2번 코드와 동일) =====
 LIDAR_PORT = "COM3"
+OBSTACLE_START_DIST = 1000
+SHIFT_GAIN = 1.2
+OBSTACLE_CLEAR_TIME = 1.5
 
-# ✅ 실제 주행 속도(요청): 120
-DRIVE_SPEED = 120
+# ===== 2차선 복귀/유지 보완 (1번 코드 방식) =====
+LANE2_BIAS_RATIO = 0.12            # 화면 폭 대비 오른쪽 bias 비율
+LANE_BIAS_ONLY_WHEN_BOTH = True    # 양쪽 라인 보일 때만 bias 허용
+BOTH_SEEN_HOLD_SEC = 0.6           # both-line 유지 시간
+BOTH_SEEN_STREAK_MIN = 2           # both-line 최소 연속 프레임(가볍게)
 
-# ✅ 더 빨리 반응: 트리거 거리 상향
-OBSTACLE_DIST_STAGE1 = 2200   # 1번 장애물: 더 먼 거리에서 시작
-OBSTACLE_DIST_STAGE2 = 1900   # 2번 장애물: 더 먼 거리에서 시작
-
-# ✅ 피하는 시간(조향 유지 시간)은 줄이지 않음 (원래 값 유지)
-OBSTACLE_CLEAR_TIME_STAGE1 = 1.5
-OBSTACLE_CLEAR_TIME_STAGE2 = 2.2
-
-# ✅ shift 강도(필요시 조절)
-SHIFT_GAIN = 2.0
-
-# ✅ 더 빨리 잡히게: 전방 각도 범위 확대 (±30 -> ±40)
-FRONT_ANGLE = 40  # 35~45 추천
-
-# ✅ 사전 회피(Pre-avoid): 트리거보다 더 멀리서도 "조금씩" 미리 피하기 시작
-PRE_AVOID_MARGIN = 500  # mm (300~700 추천)
-
-# ✅ 2차선 유지 bias (원 코드 유지)
-LANE2_BIAS_RATIO = 0.12
-LANE_BIAS_ONLY_WHEN_BOTH = True
-BOTH_SEEN_HOLD_SEC = 0.6
+# ===== 안전/기본 =====
+WIDTH, HEIGHT = 640, 480
 
 
-def get_stage_trigger_and_clear(obstacle_count_now: int):
-    """장애물 카운트에 따라 트리거/클리어링 시간을 반환"""
-    if obstacle_count_now == 0:
-        return OBSTACLE_DIST_STAGE1, OBSTACLE_CLEAR_TIME_STAGE1
-    return OBSTACLE_DIST_STAGE2, OBSTACLE_CLEAR_TIME_STAGE2
-
-
-def calc_shift_px(raw_dist: float, trigger_dist: float) -> float:
-    """가까울수록 shift가 비선형으로 커지도록 계산"""
-    calc_dist = min(raw_dist, trigger_dist)
-    d = max(0.0, float(trigger_dist - calc_dist))
-    return (d ** 1.25) * (SHIFT_GAIN / (trigger_dist ** 0.25))
-
-
-def get_front_raw_dist(scan, default_dist=2500) -> float:
+def calc_shift_px_linear(raw_dist: float) -> int:
     """
-    전방(±FRONT_ANGLE) 영역에서 dist를 모아
-    '가장 작은 값 몇 개 평균'으로 raw_dist 계산 → 노이즈 완화 + 조기 감지 안정화
+    2번 코드 shift 모델(선형):
+      shift_amount = (OBSTACLE_START_DIST - min(dist, OBSTACLE_START_DIST)) * SHIFT_GAIN
     """
-    if scan is None:
-        return float(default_dist)
-
-    dists = []
-    for (_, ang, dist) in scan:
-        if dist <= 0:
-            continue
-        if 200 < dist < 3000 and (ang >= 360 - FRONT_ANGLE or ang <= FRONT_ANGLE):
-            dists.append(dist)
-
-    if not dists:
-        return float(default_dist)
-
-    dists.sort()
-    k = min(5, len(dists))  # 작은 값 5개 평균(필요시 3~7 조절)
-    return float(sum(dists[:k]) / k)
+    calc_dist = min(float(raw_dist), float(OBSTACLE_START_DIST))
+    shift = (float(OBSTACLE_START_DIST) - calc_dist) * float(SHIFT_GAIN)
+    if shift < 0:
+        shift = 0.0
+    return int(shift)
 
 
 def main():
-    # ====== 연결 ======
     ser = None
     lidar = None
+    cap_lane = None
 
     try:
-        ser = serial.Serial(PORT, BAUDRATE, timeout=0.1)
-        print(f"✅ {PORT} 포트 연결 성공! (1초 대기)")
-        time.sleep(1)
-    except Exception as e:
-        print(f"❌ 시리얼 연결 실패: {e}")
-        ser = None
+        # ===== 시리얼 연결 =====
+        try:
+            ser = serial.Serial(PORT, BAUDRATE, timeout=0.1)
+            print(f"✅ Serial connected: {PORT} (wait 1s)")
+            time.sleep(1)
+        except Exception as e:
+            print(f"❌ Serial connect failed: {e}")
+            ser = None
 
-    try:
-        lidar = RPLidar(LIDAR_PORT)
-        print(f"✅ 라이다 연결 성공: {LIDAR_PORT}")
-    except Exception as e:
-        print(f"❌ 라이다 초기화 실패: {e}")
-        lidar = None
+        # ===== 라이다 연결 =====
+        try:
+            lidar = RPLidar(LIDAR_PORT)
+            print(f"✅ LiDAR connected: {LIDAR_PORT}")
+        except Exception as e:
+            print(f"❌ LiDAR init failed: {e}")
+            lidar = None
 
-    cap_lane = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
-    width, height = 640, 480
-    cap_lane.set(3, width)
-    cap_lane.set(4, height)
+        # ===== 카메라(1번 코드 방식) =====
+        cap_lane = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
+        cap_lane.set(3, WIDTH)
+        cap_lane.set(4, HEIGHT)
+        if not cap_lane.isOpened():
+            print("❌ Lane camera open failed")
+            return
+        configure_camera_auto(cap_lane)
 
-    if not cap_lane.isOpened():
-        print("❌ 차선 카메라 오류")
-        return
+        # ===== 상태 변수 =====
+        last_serial_time = 0.0
+        last_speed_time = 0.0
 
-    configure_camera_auto(cap_lane)
+        # both-line gate
+        both_seen_streak = 0
+        last_both_seen_time = 0.0
 
-    # ====== 상태 변수 ======
-    obstacle_count = 0
-    is_obstacle_detected = False
-    obs_clear_finished_time = 0.0
-    obstacle_last_seen_time = 0.0
+        # obstacle states (2번 코드 방식)
+        obstacle_count = 0
+        is_obstacle_detected = False
+        obs_clear_finished_time = 0.0
+        obstacle_last_seen_time = 0.0
 
-    last_serial_time = 0.0
-    last_speed_time = 0.0
+        # lane preference (1번 코드 보완)
+        desired_lane = 2  # 시작은 2차선 기준(필요하면 1로 바꿔도 됨)
 
-    # both-line 기반 bias
-    both_seen_streak = 0
-    last_both_seen_time = 0.0
-    desired_lane = 2
-
-    try:
+        # 초기 속도
         if ser:
-            ser.write(f"D,{DRIVE_SPEED}\n".encode())
+            ser.write(f"D,{MAX_SPEED}\n".encode())
 
-        print("🚀 주행 시작 (Obstacle Avoid Mode)")
+        print("🚀 Start: Obstacle Avoid ONLY (Merged)")
+
         scan_iter = lidar.iter_scans() if lidar is not None else [None] * (10**9)
 
         for scan in scan_iter:
-            # 수신 버퍼 비우기
+            now = time.time()
+
+            # 수신 버퍼 정리(필수는 아니지만 지연 줄이기)
             if ser:
                 try:
                     if ser.in_waiting > 0:
@@ -141,18 +114,22 @@ def main():
                 except:
                     pass
 
-            now = time.time()
-
-            # ===== 라이다 전방거리 =====
-            raw_dist = get_front_raw_dist(scan, default_dist=2500)
+            # ===== 라이다 전방 최소거리 =====
+            raw_dist = 2000
+            if scan is not None:
+                for (_, ang, dist) in scan:
+                    # 2번 코드 전방 조건(대략 동일): 200<dist<1500, ang 전방(330~30)
+                    if 200 < dist < 1500 and (ang >= 330 or ang <= 30):
+                        if dist < raw_dist:
+                            raw_dist = dist
 
             # ===== 카메라 =====
             ret, frame_lane = cap_lane.read()
             if not ret:
-                print("❌ 카메라 신호 끊김")
+                print("❌ Camera frame failed")
                 break
-            if frame_lane.shape[1] != width:
-                frame_lane = cv2.resize(frame_lane, (width, height))
+            if frame_lane.shape[1] != WIDTH:
+                frame_lane = cv2.resize(frame_lane, (WIDTH, HEIGHT))
 
             lane = compute_lane(frame_lane)
             left, right = lane["left"], lane["right"]
@@ -166,26 +143,25 @@ def main():
             else:
                 both_seen_streak = max(0, both_seen_streak - 1)
 
-            # ===== 장애물 회피 상태결정 =====
-            stage_trigger, stage_clear_time = get_stage_trigger_and_clear(obstacle_count)
-
+            # ===== 장애물 회피 상태결정 (2번 코드와 동일) =====
             avoid_direction = 0
             status_msg = "NORMAL"
             status_color = (0, 255, 0)
-            final_speed = DRIVE_SPEED
+            final_speed = MAX_SPEED
 
-            if raw_dist < stage_trigger:
+            if raw_dist < OBSTACLE_START_DIST:
                 obstacle_last_seen_time = now
 
-                # ✅ 장애물 카운트 증가(원 코드 유지)
-                if (not is_obstacle_detected) and (now - obs_clear_finished_time > 1.5):
-                    obstacle_count += 1
-                    is_obstacle_detected = True
-                    print(f"⚠️ 장애물 #{obstacle_count} 감지! (dist={raw_dist:.0f}mm)")
-                    if obstacle_count == 1:
-                        desired_lane = 1
-                    elif obstacle_count == 2:
-                        desired_lane = 2
+                if not is_obstacle_detected:
+                    if now - obs_clear_finished_time > 1.5:
+                        obstacle_count += 1
+                        is_obstacle_detected = True
+                        print(f"⚠️ Obstacle #{obstacle_count} detected")
+                        # 1번 코드 보완: 장애물 1개째면 1차선, 2개째면 2차선 복귀
+                        if obstacle_count == 1:
+                            desired_lane = 1
+                        elif obstacle_count == 2:
+                            desired_lane = 2
 
                 if obstacle_count == 1:
                     avoid_direction = -1
@@ -200,9 +176,8 @@ def main():
                     final_speed = min(final_speed, 120)
 
             else:
-                # ✅ 피하는 시간(조향 유지 시간)은 그대로 유지 (CLEARING)
                 if is_obstacle_detected:
-                    if (now - obstacle_last_seen_time) < stage_clear_time:
+                    if now - obstacle_last_seen_time < OBSTACLE_CLEAR_TIME:
                         if obstacle_count == 1:
                             avoid_direction = -1
                         elif obstacle_count == 2:
@@ -213,35 +188,33 @@ def main():
                         is_obstacle_detected = False
                         obs_clear_finished_time = now
                         avoid_direction = 0
-                        print("✅ 복귀")
+                        print("✅ Back to lane (obstacle cleared)")
 
-            # ===== 타겟 계산(기본 + shift + bias) =====
-            base_target = base_target_from_lines(width, left, right)
+            # ===== 타겟 계산 (1번 코드 방식 + 2번 코드 shift) =====
+            base_target = base_target_from_lines(WIDTH, left, right)
+            shift_px = 0
 
-            # ✅ 더 빨리(더 멀리서) 피하기 시작: pre_trigger로 shift를 미리 발생
-            shift_px = 0.0
-            pre_trigger = stage_trigger + PRE_AVOID_MARGIN
-
-            # pre-avoid는 "회피 방향이 정해졌을 때"만 적용(헛움직임 방지)
+            # 회피 중 shift 적용(2번 코드 방식: 선형)
             if avoid_direction != 0:
-                shift_px = calc_shift_px(raw_dist, pre_trigger)
+                shift_px = calc_shift_px_linear(raw_dist)
                 if avoid_direction == -1:
                     base_target -= shift_px
                 else:
                     base_target += shift_px
 
-            # 2차선 유지 bias (회피가 끝나고 desired_lane=2일 때만)
+            # 2차선 유지 bias (회피 종료 & desired_lane=2일 때)
             bias_allowed = True
             if LANE_BIAS_ONLY_WHEN_BOTH:
-                bias_allowed = (both_seen_streak >= 2) and ((now - last_both_seen_time) <= BOTH_SEEN_HOLD_SEC)
+                bias_allowed = (
+                    both_seen_streak >= BOTH_SEEN_STREAK_MIN
+                    and (now - last_both_seen_time) <= BOTH_SEEN_HOLD_SEC
+                )
 
             if (desired_lane == 2) and (avoid_direction == 0) and bias_allowed:
-                base_target += int(width * LANE2_BIAS_RATIO)
+                base_target += int(WIDTH * LANE2_BIAS_RATIO)
 
-            # 화면 범위 밖 방지
-            base_target = max(0, min(width - 1, int(base_target)))
-
-            angle = angle_from_target(width, height, base_target)
+            # 조향 변환
+            angle = angle_from_target(WIDTH, HEIGHT, base_target)
             servo_val = servo_from_angle(angle)
 
             # ===== 통신 =====
@@ -249,31 +222,40 @@ def main():
                 if now - last_serial_time > SERIAL_DELAY:
                     ser.write(f"S,{servo_val}\n".encode())
                     last_serial_time = now
+
                 if now - last_speed_time > SPEED_REFRESH_DELAY:
                     ser.write(f"D,{final_speed}\n".encode())
                     last_speed_time = now
 
             # ===== 디스플레이 =====
             cv2.polylines(mask_bgr, [roi_points], True, (0, 255, 255), 2)
-            cv2.circle(mask_bgr, (int(base_target), int(height * ROI_HEIGHT_RATIO)), 10, (0, 0, 255), -1)
+            cv2.circle(mask_bgr, (int(base_target), int(HEIGHT * ROI_HEIGHT_RATIO)), 10, (0, 0, 255), -1)
 
             cv2.putText(
                 mask_bgr,
-                f"speed:{final_speed} | obs#{obstacle_count} dist:{raw_dist:.0f} trig:{stage_trigger} pre:{pre_trigger}",
-                (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2
+                f"obs#{obstacle_count} dist:{raw_dist} trig:{OBSTACLE_START_DIST} desired_lane:{desired_lane}",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
             )
             cv2.putText(
                 mask_bgr,
-                f"{status_msg} | angle:{angle:.1f} shift:{shift_px:.0f}",
-                (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.75, status_color, 2
+                f"{status_msg} | angle:{angle:.1f} shift:{shift_px} both:{both_seen_streak}",
+                (20, 80),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                status_color,
+                2,
             )
 
-            cv2.imshow("Lane + Obstacle Avoid", mask_bgr)
+            cv2.imshow("Lane + Obstacle (Merged)", mask_bgr)
             if cv2.waitKey(1) == ord("q"):
                 break
 
     finally:
-        print("\n🛑 안전 정지")
+        print("\n🛑 SAFE STOP")
         if ser:
             try:
                 for _ in range(3):
@@ -283,13 +265,19 @@ def main():
                 ser.close()
             except:
                 pass
+
         if lidar is not None:
             try:
                 lidar.stop()
                 lidar.disconnect()
             except:
                 pass
-        cap_lane.release()
+
+        if cap_lane is not None:
+            try:
+                cap_lane.release()
+            except:
+                pass
         cv2.destroyAllWindows()
 
 
