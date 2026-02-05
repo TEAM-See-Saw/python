@@ -270,7 +270,7 @@ def main():
                 elif state == STATE_WAIT_AFTER_PARK:
                     cmd_speed = 0;
                     msg = "PARKED (WAITING)"
-                    if curr_time - state_timer > 4.0:
+                    if curr_time - state_timer > 3.0: # 3초 후 출차
                         state = STATE_EXIT_ADJUST if (dist_90 < 600 or dist_90 < dist_270) else STATE_EXIT_TURN
                         state_timer = curr_time
 
