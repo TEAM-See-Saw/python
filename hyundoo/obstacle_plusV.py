@@ -24,8 +24,8 @@ OBSTACLE_DIST_STAGE2 = 900
 SHIFT_GAIN = 1.5
 
 # 회피 후 유지 시간
-OBSTACLE_CLEAR_TIME_STAGE1 = 3.5
-OBSTACLE_CLEAR_TIME_STAGE2 = 2.5 # 2번 장애물은 좀 더 짧게 (복귀용)
+OBSTACLE_CLEAR_TIME_STAGE1 = 2.5
+OBSTACLE_CLEAR_TIME_STAGE2 = 1.5 # 2번 장애물은 좀 더 짧게 (복귀용)
 
 # ★ [수정 2] 장애물 사이 쿨타임 변수화 및 증가 (1.5 -> 2.5)
 # 1번 피하고 나서 2.5초 동안은 라이다를 무시하고 차선만 보고 달려서 자세를 잡음

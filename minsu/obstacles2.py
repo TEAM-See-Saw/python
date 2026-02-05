@@ -31,7 +31,7 @@ ANGLE_KEEP_MIN = 320
 
 # 회피 강도 (Gain)
 SHIFT_GAIN_BASE = 1.5
-SHIFT_GAIN_STRONG = 1.8  # 2번 장애물 복귀 시 강하게
+SHIFT_GAIN_STRONG = 2.5  # 2번 장애물 복귀 시 강하게
 
 # 다음 장애물 카운트 쿨다운
 OBSTACLE_COUNT_COOLDOWN = 2.0
