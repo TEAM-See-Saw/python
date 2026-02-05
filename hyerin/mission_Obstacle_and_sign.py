@@ -23,7 +23,7 @@ SERIAL_DELAY = 0.05
 SPEED_REFRESH_DELAY = 1.0
 
 # --- 속도 & 모터 설정 ---
-SPEED_NORMAL = 100
+SPEED_NORMAL = 120
 SPEED_SLOW = 50        # ✅ 감속이 되게 조정(원하면 100으로 되돌려도 됨)
 SPEED_STOP = 0
 

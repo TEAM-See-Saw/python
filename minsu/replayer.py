@@ -6,15 +6,15 @@ import keyboard  # pip install keyboard
 # ==========================================
 # [설정] 재생할 로그 파일 이름 입력
 # ==========================================
-LOG_FILE = ""  # <-- 실제 파일명으로 수정하세요
+LOG_FILE = "far_1_3.csv"  # <-- 실제 파일명으로 수정하세요
 PORT = 'COM4'
-BAUDRATE = 115200  # ★ 아두이노와 속도 일치ㅂ
+BAUDRATE = 115200  # ★ 아두이노와 속도 일치
 
 # 아두이노 연결
 try:
     ser = serial.Serial(PORT, BAUDRATE, timeout=1)
     time.sleep(2)
-    # 시작 전 버퍼 한번 비우기q
+    # 시작 전 버퍼 한번 비우기
     ser.reset_input_buffer()
     print("✅ 아두이노 연결 성공. 리플레이 준비...")
 except Exception as e:
