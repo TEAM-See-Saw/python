@@ -25,7 +25,7 @@ SHIFT_GAIN = 1.5
 
 # 회피 후 유지 시간
 OBSTACLE_CLEAR_TIME_STAGE1 = 2.5
-OBSTACLE_CLEAR_TIME_STAGE2 = 1.5 # 2번 장애물은 좀 더 짧게 (복귀용)
+OBSTACLE_CLEAR_TIME_STAGE2 = 2.0 # 2번 장애물은 좀 더 짧게 (복귀용)
 
 # ★ [수정 2] 장애물 사이 쿨타임 변수화 및 증가 (1.5 -> 2.5)
 # 1번 피하고 나서 2.5초 동안은 라이다를 무시하고 차선만 보고 달려서 자세를 잡음
@@ -167,7 +167,7 @@ def main():
                 # 장애물이 라이다에서 사라짐 (혹은 쿨타임 중)
                 
                 # 쿨타임 중이라도 , 전방 60cm 이내에 뭔가 있으면 즉시 반응해야함.
-                if (not is_obstacle_detected) and (raw_dist < 600):
+                if (not is_obstacle_detected) and (raw_dist < 700):
                     print("🚨 긴급! 쿨타임 강제 종료 (너무 가까움)")
                     obs_clear_finished_time = now - 100 # 쿨타임 즉시 만료시킴
 
