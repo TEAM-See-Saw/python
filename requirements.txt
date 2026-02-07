@@ -1,4 +1,0 @@
-pyserial
-keyboard
-rplidar-roboticia
-numpy
