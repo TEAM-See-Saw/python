@@ -10,14 +10,14 @@ from rplidar import RPLidar # pip install rplidar-roboticia
 # ==========================================
 # [1] 설정 (본인 환경에 맞게 수정)
 # ==========================================
-CAM_INDEX = 1
+CAM_INDEX = 0
 LIDAR_PORT = 'COM3'     # 라이다 포트 확인
 ARDUINO_PORT = 'COM4'   # 아두이노 포트 확인
 BAUDRATE = 115200
 
 # 제어값 설정
 VAL_LEFT = 680; VAL_RIGHT = 480; VAL_CENTER = 570
-SPEED_FWD = 255; SPEED_STOP = 0; SPEED_BWD = -255
+SPEED_FWD = 130; SPEED_STOP = 0; SPEED_BWD = -130
 
 # 데이터 저장 경로
 BASE_SAVE_DIR = "dataset_log"
