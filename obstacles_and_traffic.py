@@ -158,6 +158,24 @@ def calc_shift_px(raw_dist, trigger_dist):
     d = max(0.0, float(trigger_dist - calc_dist))
     return (d ** 1.25) * (SHIFT_GAIN / (trigger_dist ** 0.25))
 
+# [추가 함수] 라이더 스캔을 안전하게 가져오는 제너레이터
+def robust_scan_iter(lidar):
+    while True:
+        try:
+            # 기존 iter_scans 실행
+            for scan in lidar.iter_scans():
+                yield scan
+        except Exception as e:
+            print(f"⚠️ LiDAR 버퍼 오류 발생 ({e}). 재접속 중...")
+            try:
+                lidar.stop()
+                lidar.clean_input() # 버퍼 비우기 (지원하는 버전의 경우)
+                time.sleep(0.1)
+                lidar.start_motor()
+            except:
+                pass
+            time.sleep(0.5) # 잠시 대기 후 재시도
+
 
 # ==============================================================================
 # [메인] 실행 루프
@@ -239,8 +257,10 @@ def main():
     if ser:
         ser.write(f"D,{MAX_SPEED}\n".encode())
 
-    # LiDAR 스캔 반복자 생성 (없으면 빈 리스트)
-    scan_iter = lidar.iter_scans() if lidar else [None] * 10000
+    if lidar:
+        scan_iter = robust_scan_iter(lidar)
+    else:
+        scan_iter = [None] * 10000  # 라이더 없으면 더미 데이터
 
     try:
         for scan in scan_iter:
