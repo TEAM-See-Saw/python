@@ -29,8 +29,7 @@ ROI_X_RIGHT_RATIO = 0.6875
 STEERING_OFFSET = -2
 
 # --- 필터링 고정값 ---
-L_THRESHOLD = 170
-# L_THRESHOLD = 230 # 융기원
+L_THRESHOLD = 230 # 융기원
 
 # ==========================================
 # [2] 시리얼 연결
@@ -144,12 +143,6 @@ def main():
 
     if not cap.isOpened(): print("❌ 카메라 오류"); return
 
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    out = cv2.VideoWriter('lane_record.avi', fourcc, 20.0, (1280, 480))
-    print("🎥 녹화 시작: lane_record.avi")
-
-    print("\n🚀 3초 후 출발!");
-    for i in range(3, 0, -1): print(f"{i}.."); time.sleep(1)
 
     if ser: ser.write(f"D,{MAX_SPEED}\n".encode())
 
@@ -209,8 +202,6 @@ def main():
             cv2.putText(combined, f"Angle: {angle:.1f} Offset: {STEERING_OFFSET}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
                         0.8, (0, 255, 0), 2)
 
-            out.write(combined)
-
             cv2.imshow("Auto Exposure Lane Tracing", combined)
             if cv2.waitKey(1) == ord('q'): break
 
@@ -222,9 +213,6 @@ def main():
         if ser:
             for _ in range(3): ser.write(b"D,0\n"); ser.write(b"S,570\n"); time.sleep(0.05)
             ser.close()
-
-        if 'out' in locals() and out.isOpened():
-            out.release()
 
         cap.release()
         cv2.destroyAllWindows()
