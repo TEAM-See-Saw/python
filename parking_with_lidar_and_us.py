@@ -179,7 +179,7 @@ def main():
                         msg = "FIND CAR 1"
                         if 100 < lidar_radar < 2000:
                             stable_count += 1
-                            if stable_count > 2:
+                            if stable_count > 2: # 카운트를 확 늘렸어야 했나?
                                 reference_dist = lidar_radar;
                                 search_step = STEP_PASS_CAR1;
                                 stable_count = 0
